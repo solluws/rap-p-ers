@@ -1,0 +1,27 @@
+# credentials -- NEVER commit these
+tokens.txt
+accounts.txt
+token.txt
+*.token
+.env
+
+# run output
+log.txt
+diag.txt
+run.txt
+*.log
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/
+
+# editors
+.vscode/
+.idea/
+.DS_Store
