@@ -45,6 +45,21 @@ class RawMethod:
         ]
         return matches[0] if len(matches) == 1 else None
 
+    @property
+    def response_schema(self) -> Optional[dict]:
+        response_name = self.info["response"]
+
+        direct = MESSAGE_SCHEMAS.get(response_name)
+        if direct is not None:
+            return direct
+        suffix = "." + response_name
+        matches = [
+            schema
+            for name, schema in MESSAGE_SCHEMAS.items()
+            if name.endswith(suffix)
+        ]
+        return matches[0] if len(matches) == 1 else None
+
     async def __call__(
         self,
         payload: bytes = b"",
@@ -157,6 +172,7 @@ class RawAPI:
         )
         info = raw_method.info
         info["request_schema"] = raw_method.request_schema
+        info["response_schema"] = raw_method.response_schema
         return info
 
     def _resolve_service(self, value: str) -> str:

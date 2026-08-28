@@ -80,9 +80,22 @@ class LRUCache:
 class StateCache:
     """Remembers users, members, and channel/role names seen in traffic."""
 
-    def __init__(self, *, max_users: int = 5000) -> None:
+    def __init__(
+        self,
+        *,
+        max_users: int = 5000,
+        max_communities: int = 500,
+        max_members_per_community: int = 2000,
+    ) -> None:
         self.users = LRUCache(max_users)              # user_id -> {"username": ...}
-        self.members: Dict[str, LRUCache] = {}        # community_id -> user_id -> member
+        # Bounded on both axes. The per-community bucket was always capped,
+        # but the community_id -> bucket dict was a plain dict that never
+        # evicted, so a long-running client accumulated one 2000-entry cache
+        # per community it ever saw and never gave any of it back. That is
+        # invisible in short runs and the whole point of a process meant to
+        # stay up for days.
+        self.max_members_per_community = max_members_per_community
+        self.members: LRUCache = LRUCache(max_communities)
         self._hits = 0
         self._misses = 0
 
@@ -124,7 +137,10 @@ class StateCache:
         user_id = getattr(member, "user_id", None) or getattr(member, "id", None)
         if not user_id:
             return
-        bucket = self.members.setdefault(community_id, LRUCache(2000))
+        bucket = self.members.get(community_id)
+        if bucket is None:
+            bucket = LRUCache(self.max_members_per_community)
+            self.members[community_id] = bucket
         bucket.set(user_id, member)
         self.remember_user(
             user_id,

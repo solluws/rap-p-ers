@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 import subprocess
 import sys
 import urllib.request
@@ -29,6 +30,8 @@ from ..protocol import (
     length_field,
 )
 from ..transport import GrpcWebTransport
+
+log = logging.getLogger("rootpy.calls")
 
 BASE = "https://api.rootapp.com/root.WebRtcGrpcService"
 SESSION_CREATE = f"{BASE}/SessionCreate"
@@ -170,13 +173,21 @@ class CallService:
             "screen_audio_bandwidth": 0,
             "error_code": None,
             "error_description": None,
+            # 0.9.128 additions -- WebRtcSessionCreateResponse fields 17/18/19
+            # (Backend, ServerUrl, AccessToken). backend is WebRtcBackend:
+            # 0=Unspecified, 1=V1, 2=V2.
+            "backend": 0,
+            "server_url": None,
+            "access_token": None,
         }
         for flag, frame in iter_grpc_web_frames(body):
             if flag & 0x80:
                 continue
             for number, wire_type, value in iter_fields(frame):
                 if number == 4 and wire_type == 2:
-                    description_type, description_sdp = cls._parse_description(value)
+                    description_type, description_sdp = (
+                        cls._parse_session_description(value)
+                    )
                     result["session_description_type"] = description_type
                     result["session_description_sdp"] = description_sdp
                 elif number == 5 and wire_type == 2:
@@ -193,6 +204,20 @@ class CallService:
                     result["error_code"] = cls._decode_wrapper(value)
                 elif number == 16 and wire_type == 2:
                     result["error_description"] = cls._decode_wrapper(value)
+                elif number == 17 and wire_type == 0:
+                    result["backend"] = int(value)
+                elif number == 18 and wire_type == 2:
+                    # ServerUrl/AccessToken are bare strings here, not the
+                    # StringValue wrappers used for session_id and the errors.
+                    result["server_url"] = value.decode(
+                        "utf-8",
+                        errors="replace",
+                    )
+                elif number == 19 and wire_type == 2:
+                    result["access_token"] = value.decode(
+                        "utf-8",
+                        errors="replace",
+                    )
         return result
 
     async def create_session(
@@ -201,6 +226,7 @@ class CallService:
         *,
         community_id: Optional[str] = None,
         session_description: Optional[bytes] = None,
+        supports_v2: bool = False,
     ) -> CallSession:
         container_id = normalize_root_guid(container_id)
         if community_id is not None:
@@ -212,6 +238,11 @@ class CallService:
         )
         if session_description is not None:
             payload += length_field(12, session_description)
+        if supports_v2:
+            # WebRtcSessionCreateRequest field 13 (SupportsV2). The app omits it
+            # when false, so we do too -- default False keeps the bytes on the
+            # wire byte-identical to what this client sent before 0.9.128.
+            payload += bool_field(13, True)
 
         response = await self._unary(
             SESSION_CREATE,
@@ -236,6 +267,9 @@ class CallService:
             video_bandwidth=parsed["video_bandwidth"],
             screen_bandwidth=parsed["screen_bandwidth"],
             screen_audio_bandwidth=parsed["screen_audio_bandwidth"],
+            backend=parsed["backend"],
+            server_url=parsed["server_url"],
+            access_token=parsed["access_token"],
         )
         self.active_session = session
         self.active_community_id = community_id
@@ -870,13 +904,7 @@ class CallService:
         if parsed.scheme in ("http", "https"):
             request = urllib.request.Request(
                 source,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/150.0.0.0 Safari/537.36"
-                    )
-                },
+                headers={"User-Agent": "rootpy"},
             )
             with urllib.request.urlopen(request, timeout=60) as response:
                 content_type = (
@@ -907,18 +935,16 @@ class CallService:
 
         try:
             from playwright.async_api import async_playwright
-        except ImportError:
-            await asyncio.to_thread(
-                subprocess.check_call,
-                [
-                    sys.executable,
-                    "-m",
-                    "pip",
-                    "install",
-                    "playwright",
-                ],
-            )
-            from playwright.async_api import async_playwright
+        except ImportError as exc:
+            from ..media_bootstrap import MediaDependencyMissing
+
+            raise MediaDependencyMissing(
+                "Playwright",
+                hint=(
+                    'pip install "rootpy[voice]" '
+                    "&& python -m playwright install chromium"
+                ),
+            ) from exc
 
         self._playwright = await async_playwright().start()
 
@@ -936,16 +962,9 @@ class CallService:
                 args=launch_args,
             )
         except Exception:
-            await asyncio.to_thread(
-                subprocess.check_call,
-                [
-                    sys.executable,
-                    "-m",
-                    "playwright",
-                    "install",
-                    "chromium",
-                ],
-            )
+            # Chrome channel unavailable; fall back to Playwright's bundled
+            # Chromium. If that is not downloaded either, the error below
+            # names the one-off command to fetch it.
             self._browser = await self._playwright.chromium.launch(
                 headless=True,
                 args=launch_args,
@@ -1241,16 +1260,22 @@ class CallService:
                 "missing " + ", ".join(repr(item) for item in missing)
             )
 
-        debug_path = Path.home() / "Desktop" / "rootpy_offer.sdp"
-        debug_path.write_text(local_sdp, encoding="utf-8")
-        print(f"Saved Chromium SDP to {debug_path}")
-
+        # This used to write ~/Desktop/rootpy_offer.sdp and print two lines to
+        # stdout on *every* play_audio call -- leftover scaffolding from
+        # working out Root's SDP layout. It dropped an unrequested file in the
+        # user's home directory, hard-failed on any host without a Desktop
+        # folder (write_text does not mkdir -- containers, headless servers,
+        # most Linux setups), and corrupted the stdout of any CLI or piped
+        # program that played audio. It is a log line now.
+        #
+        #     logging.getLogger("rootpy.calls").setLevel(logging.DEBUG)
         media_lines = [
             line
             for line in local_sdp.splitlines()
             if line.startswith("m=")
         ]
-        print("Chromium SDP media lines:", media_lines)
+        log.debug("Chromium SDP media lines: %s", media_lines)
+        log.debug("Chromium offer SDP:\n%s", local_sdp)
 
         microphone_mid = "0"
         sections = re.split(r"(?=^m=)", local_sdp, flags=re.MULTILINE)

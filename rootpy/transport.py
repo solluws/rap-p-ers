@@ -1,11 +1,30 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import random
 import logging
 import time
 
-import httpx
+# httpx is ~45 ms of import time and is only needed once a request is
+# actually made, so it is imported on first use. Everything below refers to
+# it through _httpx() rather than a module-level name.
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    import httpx
+
+_httpx_module = None
+
+
+def _httpx():
+    """Import httpx on first use and cache the module."""
+    global _httpx_module
+    if _httpx_module is None:
+        import httpx as _module
+
+        _httpx_module = _module
+    return _httpx_module
 from typing import Optional
 from urllib.parse import unquote
 
@@ -16,6 +35,31 @@ from .exceptions import (
     make_http_error,
 )
 log = logging.getLogger("rootpy.transport")
+
+
+def _proxy_kwarg() -> str:
+    """``proxy`` or ``proxies``, whichever this httpx wants.
+
+    httpx renamed it in 0.26 and removed the old spelling in 0.28, so both
+    have to be supported. The awkward part is *asking*: reading
+    ``inspect.signature(httpx.AsyncClient)`` is wrong, because that symbol is
+    routinely replaced -- test doubles, tracing wrappers, and the proxy audit
+    in ``provisioner/proxiedexample.py`` all subclass it with ``(*args, **kwargs)``, which
+    advertises neither name and silently sent us down the ``proxies`` branch
+    on an httpx that had already dropped it.
+
+    So walk the MRO to the class httpx itself defined and ask that one.
+    """
+    import inspect
+
+    import httpx
+
+    base = next(
+        (cls for cls in httpx.AsyncClient.__mro__
+         if getattr(cls, "__module__", "").startswith("httpx")),
+        httpx.AsyncClient,
+    )
+    return "proxy" if "proxy" in inspect.signature(base).parameters else "proxies"
 
 
 def _new_stats():
@@ -50,8 +94,13 @@ class GrpcWebTransport:
         retry_base: float = 0.35,
         max_connections: int = 200,
         max_keepalive_connections: int = 100,
+        proxy: Optional[str] = None,
     ) -> None:
-        self._client: Optional[httpx.AsyncClient] = None
+        self._client: Optional["httpx.AsyncClient"] = None
+        # Optional outbound proxy, e.g. "socks5://127.0.0.1:1080" for a
+        # wireproxy tunnel, or "http://host:port". None means a direct
+        # connection -- nothing changes for callers who don't set it.
+        self.proxy = proxy
         # endpoint -> loop time until which that endpoint is cooling down
         self._cooldowns: dict[str, float] = {}
         # Where time goes: waiting on ourselves vs the round trip.
@@ -75,19 +124,44 @@ class GrpcWebTransport:
     async def __aexit__(self, exc_type, exc, tb):
         await self.close()
 
-    def _get_client(self) -> httpx.AsyncClient:
+    def _get_client(self) -> "httpx.AsyncClient":
         if self._client is None:
+            httpx = _httpx()
             limits = httpx.Limits(
                 max_connections=self.max_connections,
                 max_keepalive_connections=self.max_keepalive_connections,
             )
-            self._client = httpx.AsyncClient(
-                http2=True,
-                timeout=self.timeout,
-                follow_redirects=False,
-                limits=limits,
-            )
+            options = {
+                "http2": True,
+                "timeout": self.timeout,
+                "follow_redirects": False,
+                "limits": limits,
+            }
+            self._apply_proxy(options)
+            self._client = httpx.AsyncClient(**options)
         return self._client
+
+    def _apply_proxy(self, options: dict) -> dict:
+        """Put this transport's proxy into httpx client kwargs, if it has one."""
+        if self.proxy:
+            options[_proxy_kwarg()] = self.proxy
+        return options
+
+    def open_plain_client(self, **options):
+        """An httpx client for fetching things that are *not* the gRPC API.
+
+        Downloading an image to upload, or pulling an asset off Root's CDN,
+        needs redirect-following and no gRPC headers -- so it cannot reuse
+        ``_get_client()``. It must still go out the same way, though: a
+        transport with a proxy that leaks arbitrary fetches around it is worse
+        than no proxy, because the caller believes they are covered.
+
+        Every fetch in this library goes through here for exactly that reason.
+        """
+        import httpx
+
+        options.setdefault("follow_redirects", True)
+        return httpx.AsyncClient(**self._apply_proxy(options))
 
     async def close(self) -> None:
         client, self._client = self._client, None
@@ -100,18 +174,46 @@ class GrpcWebTransport:
         parts = [p for p in endpoint.split("/") if p]
         return "/".join(parts[-2:]) if len(parts) >= 2 else endpoint
 
-    async def _respect_rate_limit(self, endpoint: str) -> None:
-        """Wait out any cooldown this endpoint is under.
+    @staticmethod
+    def _account_scope(headers: Optional[dict]) -> str:
+        """A short, non-reversible tag for whichever account is calling.
+
+        Root's rate limits are **per account**, but the cooldown map lives on
+        the transport -- so a transport shared between accounts used to make
+        one account's 429 hold up every other account on it. That is why
+        ``MultiClientHost(shared_transport=...)`` defaulted to off, and why
+        sharing a transport (worth ~831 ms of TLS setup per account, measured)
+        came with a penalty nobody wanted.
+
+        Scoping the key by the caller's authorization header fixes it without
+        changing a single call signature: ``unary`` already receives the
+        headers. The token is hashed and truncated, so nothing reversible is
+        held in memory or written to a log line.
+        """
+        token = (headers or {}).get("authorization") or ""
+        if not token:
+            return "anon"
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()[:8]
+
+    def _cooldown_key(self, endpoint: str, headers: Optional[dict]) -> str:
+        return f"{self._account_scope(headers)}:{self._endpoint_key(endpoint)}"
+
+    async def _respect_rate_limit(
+        self, endpoint: str, headers: Optional[dict] = None
+    ) -> None:
+        """Wait out any cooldown this endpoint is under, for this account.
 
         The server tells us to back off via 429 + Retry-After; rather than
         just retrying the one call, we remember the cooldown per endpoint so
         *every* caller waits instead of piling on more 429s. This matters once
         a sweep is fanning out across many communities.
+
+        Keyed per account as well as per endpoint -- see ``_account_scope``.
         """
         cooldowns = getattr(self, "_cooldowns", None)
         if not cooldowns:
             return
-        key = self._endpoint_key(endpoint)
+        key = self._cooldown_key(endpoint, headers)
         while True:
             until = cooldowns.get(key)
             if not until:
@@ -125,10 +227,12 @@ class GrpcWebTransport:
             )
             await asyncio.sleep(min(remaining, 5.0))
 
-    def _note_rate_limit(self, endpoint: str, retry_after: float) -> None:
+    def _note_rate_limit(
+        self, endpoint: str, retry_after: float, headers: Optional[dict] = None
+    ) -> None:
         if getattr(self, "_cooldowns", None) is None:
             self._cooldowns = {}
-        key = self._endpoint_key(endpoint)
+        key = self._cooldown_key(endpoint, headers)
         self._cooldowns[key] = (
             asyncio.get_running_loop().time() + max(0.0, retry_after)
         )
@@ -147,7 +251,7 @@ class GrpcWebTransport:
     def stats(self, value):
         self.__dict__["_stats"] = value
 
-    async def unary(self, *, endpoint: str, body: bytes, headers: dict[str, str], operation: str) -> httpx.Response:
+    async def unary(self, *, endpoint: str, body: bytes, headers: dict[str, str], operation: str) -> "httpx.Response":
         # Every gRPC-web request body must be framed (1-byte flag + 4-byte
         # big-endian length). Doing it here means no call site can forget --
         # an unframed body reaches the server as garbage and the handler
@@ -158,7 +262,7 @@ class GrpcWebTransport:
         if not is_grpc_framed(body):
             body = grpc_frame(body)
 
-        await self._respect_rate_limit(endpoint)
+        await self._respect_rate_limit(endpoint, headers)
         # Everything up to here is us: framing plus any cooldown we imposed.
         waited = time.perf_counter() - started
         roundtrip = 0.0
@@ -169,7 +273,22 @@ class GrpcWebTransport:
             try:
                 response = await self._get_client().post(endpoint, headers=headers, content=body)
                 roundtrip += time.perf_counter() - sent_at
-            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            # RemoteProtocolError is deliberately in this list and
+            # LocalProtocolError is deliberately not. httpx puts both under
+            # ProtocolError, but only the remote one means "the server hung up
+            # or sent something malformed" -- an HTTP/2 GOAWAY on a keep-alive
+            # connection, which is routine on a long-lived client and on a
+            # MultiClientHost sharing one pool across accounts. It is neither a
+            # NetworkError nor a TimeoutException, so it used to escape this
+            # block entirely: no retry regardless of max_retries, and no
+            # stats.note_error/record either, so it did not even appear in the
+            # timing report. LocalProtocolError is our own bug and retrying it
+            # just repeats it.
+            except (
+                _httpx().TimeoutException,
+                _httpx().NetworkError,
+                _httpx().RemoteProtocolError,
+            ) as exc:
                 roundtrip += time.perf_counter() - sent_at
                 if attempt <= self.max_retries:
                     self.stats.note_retry(endpoint)
@@ -185,13 +304,21 @@ class GrpcWebTransport:
             if response.status_code != 200:
                 error = make_http_error(operation, response.status_code, response.text[:200], response_headers=dict(response.headers))
                 retryable = response.status_code in {429, 502, 503, 504}
+                retry_after = response.headers.get("retry-after")
+                try: delay = float(retry_after)
+                except (TypeError, ValueError): delay = self.retry_base * (2 ** (attempt - 1)) + random.random() * 0.1
+                # Record the cooldown on *every* 429, not only on one we are
+                # about to retry. This used to sit inside the retry branch, so
+                # a 429 on the final attempt threw the server's back-off
+                # instruction away -- no cooldown for other coroutines to
+                # respect, and no rate_limited stat -- precisely when the limit
+                # was being hit hardest. Every other caller sharing this
+                # transport then sailed through _respect_rate_limit and piled
+                # straight back into a limiter that had just said "wait".
+                if response.status_code == 429:
+                    self._note_rate_limit(endpoint, delay, headers)
+                    self.stats.note_rate_limited(endpoint)
                 if retryable and attempt <= self.max_retries:
-                    retry_after = response.headers.get("retry-after")
-                    try: delay = float(retry_after)
-                    except (TypeError, ValueError): delay = self.retry_base * (2 ** (attempt - 1)) + random.random() * 0.1
-                    if response.status_code == 429:
-                        self._note_rate_limit(endpoint, delay)
-                        self.stats.note_rate_limited(endpoint)
                     self.stats.note_retry(endpoint)
                     await asyncio.sleep(max(0.0, delay))
                     waited += max(0.0, delay)

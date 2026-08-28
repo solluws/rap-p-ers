@@ -4,6 +4,7 @@ Measure login/startup cost: eager community expansion vs lazy (the new default).
 Methodology note: running one account eager and another lazy would confound
 the *mode* with the *account* -- an account in 15 communities has far more to
 expand than one in 2. So every account is run in BOTH modes and acts as its own
+
 control, alternating which mode goes first to cancel out warm-up and network
 drift, and repeating for ROUNDS to average out variance.
 
@@ -33,6 +34,12 @@ import sys
 import time
 from collections import Counter
 from pathlib import Path
+
+# Run from anywhere, installed or not: put the project root on sys.path.
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
 
 from rootpy import RootClient
 

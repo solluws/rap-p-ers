@@ -77,6 +77,26 @@ class ErrorCodeType(_RootEnum):
     NO_PERMISSION_TO_KICK = 1009
     NO_PERMISSION_TO_BAN = 1010
     PAYMENT_FAILED = 5000
+    # Added by client 0.9.128. Both are voice-call refusals, which is exactly
+    # the kind a caller branches on -- without them ``coerce`` returned a bare
+    # ``6000`` and ``format_root_error(verbose=True)`` printed a number with no
+    # name, against README's promise of a named ErrorCodeType.
+    WEB_RTC_BACKEND_MISMATCH = 6000
+    WEB_RTC_CALL_BANNED = 6001
+
+
+class PacketErrorCode(_RootEnum):
+    """Field 1 of a gateway ``ClientNotification`` -- unrelated to
+    :class:`ErrorCodeType`, which rides on API responses.
+
+    ``SYNC_LOST`` is the server saying our resume cursor is no longer valid.
+    It is the same condition the 4016 close code reports, but stated in-band
+    and *before* the socket goes away, so it is the one signal that does not
+    have to be inferred from close-code text.
+    """
+
+    UNSPECIFIED = 0
+    SYNC_LOST = 1
 
 
 class ContentFlagReason(_RootEnum):
@@ -120,6 +140,44 @@ class ChannelType(_RootEnum):
     THREADED_TEXT = 2
     VOICE = 4
     APP = 8
+
+
+class UserDirectMessageInviteConnection(_RootEnum):
+    """Who is allowed to open a DM with you.
+
+    ``FRIEND`` is the default a fresh account lands on, which is why a new
+    pair of accounts gets ``PERMISSION_DENIED`` from ``DirectMessageCreate``
+    until they befriend each other.
+    """
+
+    UNSPECIFIED = 0
+    ANY = 1
+    CONNECTED = 2       # shares a community with you
+    NONE = 3
+    FRIEND = 4
+
+
+class UserCommunityInviteConnection(_RootEnum):
+    """Who is allowed to invite you to a community."""
+
+    UNSPECIFIED = 0
+    ANY = 1
+    CONNECTED = 2
+    NONE = 3
+    FRIEND = 4
+
+
+class UserFriendshipInviteConnection(_RootEnum):
+    """Who is allowed to send you a friend request.
+
+    No ``FRIEND`` member, unlike the other two: requiring friendship in order
+    to be friended is not a state Root models.
+    """
+
+    UNSPECIFIED = 0
+    ANY = 1
+    CONNECTED = 2
+    NONE = 3
 
 
 class UserOnlineStatus(_RootEnum):

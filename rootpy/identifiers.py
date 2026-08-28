@@ -4,7 +4,7 @@ import base64
 import uuid
 import secrets
 import struct
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from .protocol import field_key
 
@@ -79,6 +79,38 @@ def create_root_guid(root_guid_type: int) -> tuple[int, int]:
     )
     low64 = int.from_bytes(random_bytes[2:10], "big")
     return high64, low64
+
+
+def root_guid_datetime(value: str) -> datetime:
+    """When a Root id was minted, read straight out of the id.
+
+    Every Root GUID is a timestamp GUID: ``create_root_guid`` above packs
+    milliseconds since 2020-01-01 UTC into the top 48 bits of the high word,
+    so unpacking is the same operation backwards. The client relies on this
+    too -- ``MessageGuid.ToDateTime()`` is how it dates a message it has
+    nothing else for.
+
+    That makes it exact for anything Root created, and worth preferring over
+    "when this process happened to see it": a backfilled message and a pushed
+    one then carry the same clock.
+
+        >>> root_guid_datetime("0030b367-6f52-8702-b0a1-aa5c7b5c338c")
+        datetime.datetime(2026, 8, 17, 22, 18, 50, 578000, tzinfo=...)
+    """
+    high64, _low64 = parse_root_guid(value)
+    return ROOT_GUID_START_DATE + timedelta(milliseconds=high64 >> 16)
+
+
+def root_guid_type(value: str) -> int:
+    """The ``RootGuidType`` byte an id carries (1 person, 2 community, 4 channel).
+
+    The low byte of the high word, per ``create_root_guid``. Useful for telling
+    what an id *is* when a payload gives you one without saying -- a container
+    id, for instance, is a channel (4) in a community and a direct message
+    (15) otherwise.
+    """
+    high64, _low64 = parse_root_guid(value)
+    return high64 & 0xFF
 
 
 def create_desktop_device_guid() -> str:

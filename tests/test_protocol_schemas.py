@@ -104,3 +104,65 @@ def test_validation_errors_decode_per_field():
 
 def test_content_flag_reason_enum():
     assert int(ContentFlagReason.SPAM) == 4
+
+
+class TestRootGuidTimestamps:
+    """Root ids carry their own creation time -- the archive relies on it.
+
+    ``create_root_guid`` packs milliseconds since 2020-01-01 UTC into the top
+    48 bits, and the desktop client reads them back the same way
+    (``MessageGuid.ToDateTime()``). That makes a backfilled message and a
+    pushed one comparable on one clock, which is the difference between an
+    archive that sorts and one that only knows when it happened to look.
+    """
+
+    def test_it_round_trips_a_guid_we_minted(self):
+        from datetime import datetime, timezone
+
+        from rootpy.identifiers import (
+            ROOT_GUID_TYPE_DESKTOP,
+            create_root_guid,
+            format_root_guid,
+            root_guid_datetime,
+        )
+
+        before = datetime.now(timezone.utc)
+        identifier = format_root_guid(*create_root_guid(ROOT_GUID_TYPE_DESKTOP))
+        after = datetime.now(timezone.utc)
+        when = root_guid_datetime(identifier)
+        assert before.replace(microsecond=0) <= when <= after
+
+    def test_a_real_id_reads_as_the_date_it_was_made(self):
+        """A community id captured live, checked against its known date."""
+        from rootpy.identifiers import root_guid_datetime
+
+        when = root_guid_datetime("0030b367-6f52-8702-b0a1-aa5c7b5c338c")
+        assert when.year == 2026 and when.month == 8 and when.day == 17
+
+    def test_the_type_byte_says_what_the_id_is(self):
+        from rootpy.identifiers import root_guid_type
+
+        # 1 person, 2 community, 4 channel -- from the client's RootGuidType.
+        assert root_guid_type("0030bf26-999d-8101-82fd-66b280480024") == 1
+        assert root_guid_type("0030b367-6f52-8702-b0a1-aa5c7b5c338c") == 2
+        assert root_guid_type("0030b367-6f52-8904-b9ce-4d0692862c50") == 4
+
+    def test_a_compact_id_reads_the_same_as_its_dashed_form(self):
+        import base64
+        import uuid
+
+        from rootpy.identifiers import root_guid_datetime
+
+        dashed = "0030b367-6f52-8702-b0a1-aa5c7b5c338c"
+        compact = base64.urlsafe_b64encode(
+            uuid.UUID(dashed).bytes
+        ).decode().rstrip("=")
+        assert root_guid_datetime(compact) == root_guid_datetime(dashed)
+
+    def test_nonsense_raises_rather_than_inventing_a_date(self):
+        import pytest
+
+        from rootpy.identifiers import root_guid_datetime
+
+        with pytest.raises(ValueError):
+            root_guid_datetime("not-a-guid")

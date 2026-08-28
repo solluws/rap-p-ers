@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional, get_type_hints, Union
 
+from .exceptions import RootError
 from .models import Channel, Message, MessageAttachment, MessageSendResult
 from .identifiers import normalize_root_guid
 from .users import User
@@ -68,8 +69,13 @@ def parse_channel_id(value: str) -> Optional[str]:
         return None
 
 
-class CommandError(Exception):
-    """Base command-processing error."""
+class CommandError(RootError):
+    """Base command-processing error.
+
+    Inherits RootError so the library-wide `except RootError` that
+    docs/errors.md tells applications to use also catches command dispatch
+    failures; they are raised on the ordinary message path.
+    """
 
 
 class CommandNotFound(CommandError):

@@ -1,7 +1,48 @@
 from __future__ import annotations
 
+from .validation import validate_nickname
+
 from pathlib import Path
 from typing import Iterable, Optional
+
+
+def unwrap_list(data):
+    """Return the item list out of a Root ``*ListResponse`` envelope.
+
+    Every list RPC answers with a message wrapping exactly one repeated field
+    -- ``CommunityRoleListResponse.CommunityRoles``,
+    ``CommunityMemberBanListResponse.CommunityMemberBans`` and so on. Handing
+    the envelope back meant iterating a ``list()`` call yielded field *names*,
+    so ``for role in await client.roles.list(...)`` gave strings and
+    ``role.id`` raised AttributeError.
+
+    Falls back to the value itself when there is nothing to unwrap, so this is
+    safe on a response shape that is already a list.
+    """
+    if data is None:
+        return []
+    if isinstance(data, (list, tuple)):
+        return list(data)
+
+    if isinstance(data, dict):
+        candidates = [v for v in data.values() if isinstance(v, (list, tuple))]
+        if len(candidates) == 1:
+            return list(candidates[0])
+        return list(data.values()) if not candidates else list(candidates[0])
+
+    found = []
+    for name in dir(data):
+        if name.startswith("_"):
+            continue
+        try:
+            value = getattr(data, name)
+        except Exception:
+            continue
+        if isinstance(value, (list, tuple)):
+            found.append(list(value))
+    if len(found) == 1:
+        return found[0]
+    return found[0] if found else []
 
 
 class RoleManager:
@@ -38,7 +79,34 @@ class RoleManager:
         ).data
 
     async def edit(self, community_id: str, role_id: str, **kwargs):
+        """Edit a role. Unsupplied fields keep their current values.
+
+        ``CommunityRoleEdit`` is a *replace*, not a patch -- the request
+        carries Name, ColorHex, both permission sets and the two flags, so
+        sending only ``name`` blanked the rest and the server answered
+        INTERNAL (13) rather than a useful validation error. Same shape as
+        CommunityEdit.
+
+        The current role is read once and every field the caller did not give
+        is carried forward. Supply them all to skip the read.
+        """
         kwargs = dict(kwargs)
+        carried = (
+            "name",
+            "color_hex",
+            "community_permission",
+            "channel_permission",
+            "is_mentionable",
+            "is_self_assignable",
+        )
+        if any(field not in kwargs for field in carried):
+            current = await self.get(community_id, role_id)
+            for field in carried:
+                if field not in kwargs:
+                    value = getattr(current, field, None)
+                    if value is not None:
+                        kwargs[field] = value
+
         kwargs["community_id"] = community_id
         kwargs["id"] = role_id
         return (
@@ -64,11 +132,11 @@ class RoleManager:
         ).data
 
     async def list(self, community_id: str):
-        return (
-            await self.client.high.community_role.list(
-                community_id=community_id,
-            )
-        ).data
+        """The community's roles, as a list of role records."""
+        response = await self.client.high.community_role.list(
+            community_id=community_id,
+        )
+        return unwrap_list(response.data)
 
     async def move(
         self,
@@ -149,19 +217,26 @@ class MemberManager:
         community_id: str,
         user_ids: Iterable[str],
     ):
-        return (
-            await self.client.high.community_member.list(
-                community_id=community_id,
-                user_ids=list(user_ids),
-            )
-        ).data
+        """The named members, as records.
+
+        ``list`` and ``list_all`` answer with the *same* wire message --
+        ``CommunityMemberExtendedListResponse`` -- but only ``list_all``
+        unwrapped it, so ``for m in await members.list(cid, ids)`` iterated
+        the envelope and yielded the field name ``'community_members'``.
+        That is the trap HANDOFF documents and every other list method here
+        already avoids; this one was simply missed.
+        """
+        response = await self.client.high.community_member.list(
+            community_id=community_id,
+            user_ids=list(user_ids),
+        )
+        return unwrap_list(response.data)
 
     async def list_all(self, community_id: str):
-        return (
-            await self.client.high.community_member.list_all(
-                community_id=community_id,
-            )
-        ).data
+        response = await self.client.high.community_member.list_all(
+            community_id=community_id,
+        )
+        return unwrap_list(response.data)
 
     async def edit_nickname(
         self,
@@ -169,6 +244,13 @@ class MemberManager:
         user_id: str,
         nickname: str,
     ):
+        """Set a member's nickname in this community.
+
+        Root validates Nickname with a RegularExpressionValidator and gives
+        no pattern; see :func:`rootpy.validation.validate_nickname` for what
+        the rule is and how much of it is confirmed.
+        """
+        validate_nickname(nickname)
         return (
             await self.client.high.community_member.edit(
                 community_id=community_id,
@@ -280,31 +362,147 @@ class CommunityFileManager:
             await self.client.high.file.create(**kwargs)
         ).data
 
-    async def get(self, **kwargs):
-        return (await self.client.high.file.get(**kwargs)).data
+    async def list(self, community_id: str, container_id: str, directory_id: str):
+        """Files in a directory -- the items, not the envelope.
 
-    async def list(self, **kwargs):
-        return (await self.client.high.file.list(**kwargs)).data
+        ``directory_id`` is required: Root applies a NotEmptyValidator to it,
+        so listing "the channel's files" means listing a directory. Get the
+        root directory id from ``client.directories.list(...)``. The old
+        ``**kwargs`` signature hid that entirely.
+        """
+        return unwrap_list(
+            (
+                await self.client.high.file.list(
+                    community_id=community_id,
+                    container_id=container_id,
+                    directory_id=directory_id,
+                )
+            ).data
+        )
 
-    async def edit(self, **kwargs):
-        return (await self.client.high.file.edit(**kwargs)).data
+    async def get(
+        self, community_id: str, container_id: str, file_id: str, directory_id: str
+    ):
+        return (
+            await self.client.high.file.get(
+                community_id=community_id,
+                container_id=container_id,
+                id=file_id,
+                directory_id=directory_id,
+            )
+        ).data
 
-    async def move(self, **kwargs):
+    async def edit(
+        self,
+        community_id: str,
+        container_id: str,
+        file_id: str,
+        directory_id: str,
+        name: str,
+    ):
+        """Rename a file. ``name`` must not contain a dot or a space.
+
+        Root validates ``Name`` with a ``RegularExpressionValidator`` and the
+        rule is not the one you would guess: **the new name is the stem, not
+        the filename.** Measured one variable at a time against a live server:
+
+        ===================  ========
+        ``renamedabcd``      accepted
+        ``renamed-abcd``     accepted
+        ``renamed_abcd``     accepted
+        ``Renamedabcd``      accepted
+        ``renamed1234``      accepted
+        ``renamedabcd.png``  rejected
+        ``renamedabcd.txt``  rejected
+        ``renamed.abcd``     rejected
+        ``renamed abcd``     rejected
+        ===================  ========
+
+        So hyphens, underscores, digits and uppercase are all fine, and it is
+        the dot and the space that are refused -- any dot, not just an
+        extension.
+
+        The asymmetry is the trap: ``FileCreate`` stores the *uploaded*
+        filename complete with its extension (``probe-1a2b.png``), and then
+        ``FileEdit`` refuses to accept that same string back. Passing the name
+        you just read off the record is the natural thing to do and it fails.
+        """
+        return (
+            await self.client.high.file.edit(
+                community_id=community_id,
+                container_id=container_id,
+                id=file_id,
+                directory_id=directory_id,
+                name=name,
+            )
+        ).data
+
+    async def move(
+        self,
+        community_id: str,
+        container_id: str,
+        file_id: str,
+        *,
+        old_directory_id=None,
+        new_directory_id=None,
+    ):
+        kwargs = {
+            "community_id": community_id,
+            "container_id": container_id,
+            "id": file_id,
+        }
+        if old_directory_id is not None:
+            kwargs["old_directory_id"] = old_directory_id
+        if new_directory_id is not None:
+            kwargs["new_directory_id"] = new_directory_id
         return (await self.client.high.file.move(**kwargs)).data
 
-    async def delete(self, **kwargs):
-        return (await self.client.high.file.delete(**kwargs)).data
+    async def delete(
+        self, community_id: str, container_id: str, file_id: str, directory_id: str
+    ):
+        """Delete a file. The wire field for the file is ``Id``."""
+        return (
+            await self.client.high.file.delete(
+                community_id=community_id,
+                container_id=container_id,
+                id=file_id,
+                directory_id=directory_id,
+            )
+        ).data
 
     async def download(self, **kwargs):
+        """Root has not implemented this. Verified live, every argument shape.
+
+        ``FileGrpcService/Download`` answers ``UNIMPLEMENTED (12)`` -- with the
+        asset id off the file record, with the file id in its place, and with
+        the field omitted entirely. It is not an argument problem.
+
+        The obvious way round is the asset service, and it does not work
+        either. A community file's ``asset_id`` builds a valid URI via
+        :meth:`~rootpy.services.assets.AssetService.uri_for_id`, but only
+        under the ``"file"`` kind, and that resolves to an *unsigned*
+        ``static.rootapp.com`` URL which is then refused with HTTP 403. The
+        ``"image"`` kind -- the one that produces signed, downloadable
+        ``imagedelivery.net`` URLs for avatars, banners and emoji -- does not
+        resolve for a file's asset at all, even when the file is a PNG.
+
+        So there is currently no way to retrieve a community file's *content*
+        through this API. Listing, renaming, moving and deleting all work; the
+        bytes do not come back.
+
+        This still issues the call rather than raising locally, so that if
+        Root implements the endpoint it simply starts working -- and the live
+        test pinning the ``UNIMPLEMENTED`` answer fails, which is the signal
+        you want.
+        """
         return (await self.client.high.file.download(**kwargs)).data
 
     async def search(self, **kwargs):
         return (await self.client.high.file.search(**kwargs)).data
 
     async def search_community(self, **kwargs):
-        return (
-            await self.client.high.file.search_community(**kwargs)
-        ).data
+        response = await self.client.high.file.search_community(**kwargs)
+        return unwrap_list(response.data)
 
 
 class LogManager:
@@ -340,9 +538,9 @@ class CommunityAppManager:
         ).data
 
     async def list(self, **kwargs):
-        return (
-            await self.client.high.community_app.list(**kwargs)
-        ).data
+        """Apps installed in a community, as a list."""
+        response = await self.client.high.community_app.list(**kwargs)
+        return unwrap_list(response.data)
 
     async def add(self, **kwargs):
         return (
@@ -382,12 +580,12 @@ class VoiceAdminManager:
         self.client = client
 
     async def list(self, community_id: str, container_id: str):
-        return (
-            await self.client.high.web_rtc.list(
-                community_id=community_id,
-                container_id=container_id,
-            )
-        ).data
+        """Who is currently connected to a voice channel."""
+        response = await self.client.high.web_rtc.list(
+            community_id=community_id,
+            container_id=container_id,
+        )
+        return unwrap_list(response.data)
 
     async def kick(
         self,
@@ -434,9 +632,9 @@ class FriendshipGroupManager:
         self.client = client
 
     async def list(self):
-        return (
-            await self.client.high.friendship_group.list()
-        ).data
+        """Your friendship groups, as a list."""
+        response = await self.client.high.friendship_group.list()
+        return unwrap_list(response.data)
 
     async def create(self, name: str):
         return (
@@ -460,17 +658,22 @@ class FriendshipGroupManager:
             )
         ).data
 
-    async def move(
-        self,
-        group_id: str,
-        *,
-        before_group_id: Optional[str] = None,
-    ):
-        kwargs = {"id": group_id}
-        if before_group_id is not None:
-            kwargs["before_friendship_group_id"] = before_group_id
+    async def move(self, group_id: str, *, before_group_id: str):
+        """Move a group so it sits before ``before_group_id``.
+
+        ``before_group_id`` is required -- Root applies a NotEmptyValidator to
+        ``BeforeFriendshipGroupId``. It used to default to None and be omitted,
+        which made the request fail rather than mean "move to the end", so the
+        optionality was misleading.
+        """
+        if not before_group_id:
+            raise ValueError(
+                "before_group_id is required: Root rejects a move without a "
+                "reference group. Pass the id of the group to sit before."
+            )
         return (
             await self.client.high.friendship_group.move(
-                **kwargs
+                id=group_id,
+                before_friendship_group_id=before_group_id,
             )
         ).data

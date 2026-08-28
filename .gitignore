@@ -1,6 +1,16 @@
 # credentials -- NEVER commit these
-tokens.txt
+# tokens.txt was listed; tokens3.txt was not, and holds three live account
+# tokens in the same name=token form. Glob it so the next numbered one is
+# covered before it exists.
+tokens*.txt
+provisioned.json
 accounts.txt
+example_accounts.json
+output.json
+usernames.json
+profiles.json
+userprofiles.json
+accounts.*.json
 token.txt
 *.token
 .env
@@ -10,6 +20,9 @@ log.txt
 diag.txt
 run.txt
 *.log
+# --timing-json artefacts
+t.json
+timing.json
 
 # python
 __pycache__/
@@ -25,3 +38,33 @@ venv/
 .vscode/
 .idea/
 .DS_Store
+
+# The archives ophanim.py and accounts.py write: real message content and
+# tens of thousands of people's profiles. Never commit these.
+ophanim.json
+ophanim.json.tmp
+ophanim.json.gz
+ophanim.jsonl
+accounts.json
+accounts.json.tmp
+accounts.json.gz
+
+# visjs: generated payloads and the deploy target. The data is extracted from
+# the package and the archives, so it is rebuilt rather than committed --
+# and activity.json carries real message counts per server.
+visjs/public/data/
+visjs/push.conf
+visjs/node_modules/
+
+# The whole provisioner tree stays local. The WireGuard profiles each carry a
+# PrivateKey line, wireproxy.exe is a 10 MB vendored binary, and the account
+# tooling is not something to publish beside the library.
+provisioner/
+*.exe
+
+# The decompiled Root client (84 MB). It is input, not work: the schemas and
+# every citation in the docs were derived FROM it, but it is somebody else's
+# copyrighted code and it would be permanent in the history. Keep it beside
+# the checkout instead. Remove this line if you want the doc citations to
+# resolve for other people.
+sources/

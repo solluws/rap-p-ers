@@ -135,7 +135,7 @@ _HTTP_STATUS_DESCRIPTIONS = {
 
 _HTTP_STATUS_HINTS = {
     400: "Check request arguments, IDs, payload shape, and required fields.",
-    401: "Validate or refresh the account session/token. If only one pool client fails, validate that client's token.",
+    401: "Validate or refresh the account session/token. If only one hosted account fails, validate that account's token.",
     403: "Check the account's permissions, roles, membership, and endpoint-specific requirements.",
     404: "Verify the endpoint/resource ID and whether it is visible to the current account.",
     409: "Refresh current state before retrying; the operation may already have been completed.",
@@ -227,8 +227,33 @@ class GrpcWebError(RootError):
             f"{self.status.name} ({self.status_code}): "
             f"{self.description}"
         )
-        if message:
+        if message and message.strip() != self.description.strip():
             details += f" [Root: {message}]"
+
+        # Root's grpc-message for a rejected request is always the same
+        # useless sentence ("One or more request values were rejected"), but
+        # the root-exception-bin header carries a RequestValidatorList naming
+        # the offending fields. That was already decoded into
+        # self.validation_errors above and then thrown away here, which made
+        # every INVALID_ARGUMENT require a round trip to diagnose. Put it in
+        # the message so the field and reason are visible wherever the error
+        # surfaces -- tests, scripts, logs, tracebacks.
+        if self.validation_errors:
+            shown = "; ".join(str(err) for err in self.validation_errors[:5])
+            extra = (
+                f" (+{len(self.validation_errors) - 5} more)"
+                if len(self.validation_errors) > 5
+                else ""
+            )
+            details += f" -> {shown}{extra}"
+        elif self.payload_kind:
+            try:
+                summary = self.root_exception.summary()
+            except Exception:
+                summary = ""
+            if summary:
+                details += f" -> {summary}"
+
         super().__init__(
             f"{_friendly_operation(operation)} failed — {details}"
         )
@@ -620,7 +645,7 @@ def format_root_error(
         ...     print(format_root_error(exc, verbose=True))
 
     Notes:
-        ``verbose=False`` is intended for high-volume pool logs.
+        ``verbose=False`` is intended for high-volume multi-account logs.
         ``verbose=True`` is intended for debugging a specific failure.
     """
     info = get_error_info(error)

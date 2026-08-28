@@ -11,7 +11,14 @@ import sys
 import time
 from pathlib import Path
 
+# Run from anywhere, installed or not: put the project root on sys.path.
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+
 from rootpy import RootClient
+
 
 CHANNEL = "00308801-dfec-8404-bb84-bf060b2169ba"
 COMMUNITY = "0030735e-ddbf-8d02-99de-255bc3fc5dc5"

@@ -4,6 +4,7 @@ from typing import Optional, Union
 import asyncio
 import getpass
 import inspect
+import logging
 from collections import deque
 from dataclasses import replace
 from collections.abc import Awaitable, Callable
@@ -45,7 +46,6 @@ from .models import (
 )
 from .services import (
     AssetService,
-    CallService,
     CommunityService,
     CommunityAdminService,
     DirectMessageService,
@@ -80,6 +80,8 @@ from .features import (
 from .permissions import ChannelPermissions
 from .users import User
 from .highlevel import HighLevelMixin
+
+log = logging.getLogger("rootpy.client")
 
 EventHandler = Callable[..., Awaitable[None]]
 
@@ -124,6 +126,8 @@ class RootClient(HighLevelMixin):
         *,
         token: Optional[str] = None,
         turnstile_token: Optional[str] = None,
+        proxy: Optional[str] = None,
+        transport: Optional[GrpcWebTransport] = None,
     ) -> None:
 
         if token is not None:
@@ -137,7 +141,12 @@ class RootClient(HighLevelMixin):
                     "Provide either token=... or both username and password"
                 )
 
-        transport = GrpcWebTransport()
+        # These are classmethods with no client behind them, so they used to
+        # build a bare transport and go direct -- sending the one request that
+        # proves you own an address around whatever proxy the rest of the
+        # signup used. `owns` keeps a caller-supplied transport open.
+        owns = transport is None
+        transport = transport or GrpcWebTransport(proxy=proxy)
         try:
             auth_token = token
 
@@ -145,6 +154,8 @@ class RootClient(HighLevelMixin):
                 auth = AuthClient(transport)
                 session = await auth.login(username, password)
                 auth_token = session.token
+
+            from .structured_api import StructuredAPI
 
             api = StructuredAPI(
                 transport,
@@ -157,7 +168,8 @@ class RootClient(HighLevelMixin):
 
             await api.user.resend_email_verification_code(**kwargs)
         finally:
-            await transport.close()
+            if owns:
+                await transport.close()
 
     @classmethod
     async def verify_email(
@@ -167,6 +179,8 @@ class RootClient(HighLevelMixin):
         password: Optional[str] = None,
         *,
         token: Optional[str] = None,
+        proxy: Optional[str] = None,
+        transport: Optional[GrpcWebTransport] = None,
     ) -> None:
         if not isinstance(verification_code, str):
             raise TypeError("verification_code must be a string")
@@ -186,7 +200,12 @@ class RootClient(HighLevelMixin):
                     "Provide either token=... or both username and password"
                 )
 
-        transport = GrpcWebTransport()
+        # These are classmethods with no client behind them, so they used to
+        # build a bare transport and go direct -- sending the one request that
+        # proves you own an address around whatever proxy the rest of the
+        # signup used. `owns` keeps a caller-supplied transport open.
+        owns = transport is None
+        transport = transport or GrpcWebTransport(proxy=proxy)
         try:
             auth_token = token
 
@@ -194,6 +213,8 @@ class RootClient(HighLevelMixin):
                 auth = AuthClient(transport)
                 session = await auth.login(username, password)
                 auth_token = session.token
+
+            from .structured_api import StructuredAPI
 
             api = StructuredAPI(
                 transport,
@@ -204,7 +225,8 @@ class RootClient(HighLevelMixin):
                 verification_code=verification_code,
             )
         finally:
-            await transport.close()
+            if owns:
+                await transport.close()
 
     def __init__(
         self,
@@ -214,26 +236,34 @@ class RootClient(HighLevelMixin):
         token: Optional[str] = None,
         command_prefix: str = ">",
         user_id: Optional[str] = None,
-        auto_install_media: bool = True,
+        require_media: bool = False,
         transport: Optional[GrpcWebTransport] = None,
         owns_transport: bool = True,
         preload_caches: bool = True,
         expand_communities: bool = False,
         message_cache_size: int = 2000,
+        proxy: Optional[str] = None,
         preload_direct_messages: bool = False,
         auto_reconnect: bool = True,
         reconnect_base: float = 1.0,
         reconnect_max: float = 30.0,
         max_reconnect_attempts: Optional[int] = None,
+        contention_pause: float = 0.0,
+        contention_threshold: int = 3,
     ) -> None:
         self.username = username
         self.password = password
         self.token = token.strip() if isinstance(token, str) and token.strip() else None
-        self.auto_install_media = auto_install_media
+        self.require_media = require_media
         self.auto_reconnect = bool(auto_reconnect)
         self.reconnect_base = float(reconnect_base)
         self.reconnect_max = float(reconnect_max)
         self.max_reconnect_attempts = max_reconnect_attempts
+        # Repeated 4016 closes mean a second client is advancing this account's
+        # sequence cursor. Set a pause (seconds) to stand off instead of
+        # retrying into the fight. See Gateway.contention_pause.
+        self.contention_pause = float(contention_pause)
+        self.contention_threshold = int(contention_threshold)
         self._owns_transport = bool(owns_transport)
         self.preload_caches = bool(preload_caches)
         # Expanding every community at login costs one GetExtended per
@@ -241,7 +271,10 @@ class RootClient(HighLevelMixin):
         # Off by default: communities expand on first access and are cached.
         self.expand_communities = bool(expand_communities)
         self.preload_direct_messages = bool(preload_direct_messages)
-        self.transport = transport or GrpcWebTransport()
+        # An optional outbound proxy, e.g. "socks5://127.0.0.1:1080".
+        # Ignored when a transport is supplied -- configure it there instead.
+        self.proxy = proxy
+        self.transport = transport or GrpcWebTransport(proxy=proxy)
         # The generated RPC registries are large (~1.2 MB of module source)
         # and cost ~770 ms to import cold -- about half of total import time --
         # but most scripts never touch them. They're built on first access
@@ -262,11 +295,10 @@ class RootClient(HighLevelMixin):
         self.dm_service = self.direct_messages
 
         self.dm = DMMemberService(self)
-        self.calls = CallService(
-            self.transport,
-            self._require_token,
-            self.direct_messages,
-        )
+        # Voice is optional and its module pulls in urllib.request,
+        # http.cookiejar and subprocess. Built on first access instead, so
+        # text-only programs never pay for it. See the `calls` property.
+        self._calls = None
         self.messages = MessageService(
             self.transport,
             self._require_token,
@@ -360,6 +392,43 @@ class RootClient(HighLevelMixin):
     def describe_services(self, name: Optional[str] = None):
         return self.services.describe(name)
 
+    def explain(self, target: Optional[str] = None):
+        """Show what a name in the API maps to, offline.
+
+        The structured layer knows the exact wire shape of every RPC, but there
+        was no path to it from the client. This is that path -- spell a name the
+        way you would reach for it and get the Python signature and the wire
+        fields together:
+
+            client.explain()                        # index of everything
+            client.explain("file")                  # a wire service's methods
+            client.explain("file.search")           # one method's request fields
+            client.explain("community_files")       # a manager's methods
+            client.explain("community_files.search")# a manager method + its wire call
+
+        The manager-to-wire link is read from the code, not a kept table, so it
+        cannot drift. Returns an :class:`~rootpy.discovery.Explanation` that
+        prints itself; ``.as_dict()`` for programmatic use.
+        """
+        from .discovery import explain as _explain
+
+        return _explain(self, target)
+
+    def preview(self, target: str, /, **kwargs):
+        """Encode a request and show what would go on the wire -- without sending.
+
+            client.preview("message.create", container_id=cid, content="hi")
+
+        Uses the same encoder the real call does, so an unknown field or a
+        malformed value (a bad GUID) raises here, offline, for the price of no
+        round trips -- a preview that encodes is a call that is well-formed.
+        Returns a :class:`~rootpy.discovery.Preview` (framed bytes, sizes, the
+        fields it would send) that prints itself.
+        """
+        from .discovery import preview as _preview
+
+        return _preview(self, target, **kwargs)
+
     @property
     def device_id(self) -> Optional[str]:
         return self.session.device_id if self.session else None
@@ -374,6 +443,12 @@ class RootClient(HighLevelMixin):
         *,
         username: Optional[str] = None,
     ) -> User:
+        """Return the cached user, or None.
+
+        Synchronous by design: this is a cache read, not a request.
+        Awaiting it raises TypeError. When you need a round trip, use
+        the awaitable fetch/ensure_* counterpart instead.
+        """
         from .identifiers import normalize_root_guid
 
         normalized = normalize_root_guid(user_id)
@@ -436,6 +511,24 @@ class RootClient(HighLevelMixin):
         from .identifiers import normalize_root_guid
 
         self.user_id = normalize_root_guid(user_id)
+
+    @property
+    def calls(self):
+        """Voice / WebRTC service, constructed on first use.
+
+        Importing :mod:`rootpy.services.calls` drags in the media stack's
+        support modules, so it is deferred until something actually reaches
+        for voice.
+        """
+        if self._calls is None:
+            from .services.calls import CallService
+
+            self._calls = CallService(
+                self.transport,
+                self._require_token,
+                self.direct_messages,
+            )
+        return self._calls
 
     def _record_sent_message_id(self, message_id: str) -> None:
         self._sent_message_ids.add(message_id)
@@ -552,6 +645,41 @@ class RootClient(HighLevelMixin):
         self._events[coroutine.__name__[3:]] = coroutine
         return coroutine
 
+    async def drain_events(self, *, timeout: Optional[float] = None) -> int:
+        """Wait for spawned event handlers to finish; return how many ran.
+
+        Event handling is deliberately fire-and-forget (see :meth:`dispatch`),
+        which leaves callers with no way to tell when the reaction to an event
+        is complete. Without this the only options are an arbitrary
+        ``asyncio.sleep`` or reaching into private state -- so this exists to
+        make "the handlers have finished" an answerable question.
+
+        Handlers spawned *by* those handlers are drained too, so a chain
+        settles rather than only its first link. Returns the number of tasks
+        awaited; ``timeout`` raises :class:`asyncio.TimeoutError` if they do
+        not settle in time, leaving them running.
+        """
+        drained = 0
+
+        async def _settle() -> None:
+            nonlocal drained
+            while True:
+                pending = tuple(
+                    task
+                    for task in self._background_tasks
+                    if task is not asyncio.current_task() and not task.done()
+                )
+                if not pending:
+                    return
+                drained += len(pending)
+                await asyncio.gather(*pending, return_exceptions=True)
+
+        if timeout is None:
+            await _settle()
+        else:
+            await asyncio.wait_for(_settle(), timeout=timeout)
+        return drained
+
     def _spawn_background(
         self,
         awaitable,
@@ -651,6 +779,25 @@ class RootClient(HighLevelMixin):
             print(f"EVENT ERROR {name}: {type(exc).__name__} {exc!r}")
 
     async def dispatch(self, name: str, event: object) -> None:
+        """Deliver an event to waiters, handlers and listeners.
+
+        **Handlers do not necessarily run before this returns.** ``message``
+        events and every ``add_listener()`` handler are spawned as background
+        tasks on purpose: a slow handler must not stall the gateway read loop,
+        and one that raises must not take the socket down with it. Only an
+        ``@client.event`` handler for a non-message event is awaited inline.
+
+        So awaiting ``dispatch()`` tells you the event was delivered, not that
+        anything finished reacting to it. When you need that -- a test, a
+        graceful shutdown, "process this batch then exit" -- use
+        :meth:`drain_events`::
+
+            await client.dispatch("message", event)
+            await client.drain_events()      # now the handlers have finished
+
+        :meth:`wait_for` is unaffected: waiters resolve inline, before any of
+        the background work is scheduled.
+        """
         # Resolve anyone waiting on this event (see wait_for).
         if self._waiters:
             still_waiting = []
@@ -1001,6 +1148,12 @@ class RootClient(HighLevelMixin):
         self,
         channel_group_id: str,
     ) -> Optional[ChannelGroup]:
+        """Return the cached channel group, or None.
+
+        Synchronous by design: this is a cache read, not a request.
+        Awaiting it raises TypeError. When you need a round trip, use
+        the awaitable fetch/ensure_* counterpart instead.
+        """
         from .identifiers import normalize_root_guid
 
         return self.channel_groups.get(
@@ -1028,6 +1181,12 @@ class RootClient(HighLevelMixin):
         return community
 
     def get_community(self, community_id: str) -> Optional[Community]:
+        """Return the cached community, or None.
+
+        Synchronous by design: this is a cache read, not a request.
+        Awaiting it raises TypeError. When you need a round trip, use
+        the awaitable fetch/ensure_* counterpart instead.
+        """
         from .identifiers import normalize_root_guid
 
         community = self.communities.get(
@@ -1044,11 +1203,23 @@ class RootClient(HighLevelMixin):
         return community
 
     def get_channel(self, channel_id: str) -> Optional[Channel]:
+        """Return the cached channel, or None.
+
+        Synchronous by design: this is a cache read, not a request.
+        Awaiting it raises TypeError. When you need a round trip, use
+        the awaitable fetch/ensure_* counterpart instead.
+        """
         from .identifiers import normalize_root_guid
 
         return self.channels.get(normalize_root_guid(channel_id))
 
     def get_message(self, message_id: str) -> Optional[Message]:
+        """Return the cached message, or None.
+
+        Synchronous by design: this is a cache read, not a request.
+        Awaiting it raises TypeError. When you need a round trip, use
+        the awaitable fetch/ensure_* counterpart instead.
+        """
         from .identifiers import normalize_root_guid
 
         return self.message_cache.get(
@@ -1059,6 +1230,12 @@ class RootClient(HighLevelMixin):
         self,
         container_id: str,
     ) -> tuple[Message, ...]:
+        """Return the cached messages cached for a container, or None.
+
+        Synchronous by design: this is a cache read, not a request.
+        Awaiting it raises TypeError. When you need a round trip, use
+        the awaitable fetch/ensure_* counterpart instead.
+        """
         from .identifiers import normalize_root_guid
 
         normalized = normalize_root_guid(container_id)
@@ -1069,9 +1246,22 @@ class RootClient(HighLevelMixin):
         )
 
     def _optional_token(self) -> str:
-        if self.session is None:
-            return ""
-        return self.session.token
+        """Bearer token if we have one, empty string otherwise.
+
+        Same sources as :meth:`_require_token` -- session first, then a token
+        passed to the constructor -- but returns "" instead of raising.
+
+        The constructor fallback is not optional politeness: StructuredAPI and
+        RawAPI omit the authorization header entirely when this returns "",
+        so a token-only client (no login) got HTTP 401 on everything routed
+        through ``client.high`` / ``client.raw``. That is most of
+        ``features.py`` and ``domain_managers.py`` -- notifications, friends,
+        blocks, user notes, member edits -- while the ``services/`` layer,
+        which uses _require_token, worked fine on the same client.
+        """
+        if self.session is not None:
+            return self.session.token
+        return self.token or ""
 
     def _require_token(self) -> str:
         """The bearer token for API calls.
@@ -1095,10 +1285,30 @@ class RootClient(HighLevelMixin):
             "Client is not logged in and no token was provided"
         )
 
+    #: Where the web API lives when no session has told us otherwise. This is
+    #: already the default for login()/login_token(), so a token-only client
+    #: knows it just as well as a logged-in one.
+    DEFAULT_WEB_API_URL = "https://api.rootapp.com/"
+
     def _require_web_api_url(self) -> str:
-        if self.session is None:
-            raise RuntimeError("Client is not logged in")
-        return self.session.web_api_url
+        """The web API base URL for asset uploads.
+
+        A session supplies this, but its absence is not a reason to refuse: a
+        token-only client hit "Client is not logged in" on every asset upload
+        -- emoji creation, community files, avatars -- even though the URL is
+        a constant that login would have set to the same value.
+
+        Only genuinely session-bound state (the gateway's hub URL, the device
+        id) still requires a real login.
+        """
+        if self.session is not None and self.session.web_api_url:
+            return self.session.web_api_url
+        if self.token:
+            return self.DEFAULT_WEB_API_URL
+        raise RuntimeError(
+            "No web API URL: log in, or construct the client with "
+            "RootClient(token=...)."
+        )
 
     async def _initialize_authenticated_state(
         self,
@@ -1245,14 +1455,23 @@ class RootClient(HighLevelMixin):
         password: str,
         email: str,
         access_token: Optional[str] = None,
+        turnstile_token: Optional[str] = None,
+        device_id: Optional[str] = None,
         command_prefix: str = ">",
-        auto_install_media: bool = True,
+        require_media: bool = False,
+        transport=None,
+        proxy: Optional[str] = None,
     ) -> "RootClient":
+        # Signup must go out the same way as everything else -- without this
+        # the new client builds its own direct transport and any proxy is
+        # silently ignored.
         client = cls(
             username=username,
             password=password,
             command_prefix=command_prefix,
-            auto_install_media=auto_install_media,
+            require_media=require_media,
+            transport=transport,
+            proxy=proxy,
         )
         try:
             client.session = await client.auth.signup(
@@ -1260,18 +1479,31 @@ class RootClient(HighLevelMixin):
                 password,
                 email,
                 access_token=access_token,
+                turnstile_token=turnstile_token,
+                device_id=device_id,
             )
             await client._initialize_authenticated_state()
-
-            await client.transport.close()
+            # NB: don't close the transport here -- the caller is being handed
+            # a live client and closing it makes the very next request fail.
             return client
         except Exception:
             await client.close()
             raise
 
     async def connect(self) -> None:
+        """Open the gateway and start dispatching events.
+
+        Requires a session: the gateway needs the hub URL and device id, and
+        only a login produces those. A constructor token is enough for RPCs
+        but not for this -- call :meth:`login_token` first (or
+        :meth:`login`), then connect.
+        """
         if self.session is None:
-            raise RuntimeError("Call login() before connect()")
+            raise RuntimeError(
+                "connect() needs a session, which a constructor token alone "
+                "does not provide. Call login_token(token) or "
+                "login(username, password) first."
+            )
         self.gateway = Gateway(
             hub_url=self.session.hub_url,
             token=self.session.token,
@@ -1281,13 +1513,43 @@ class RootClient(HighLevelMixin):
             reconnect_base=self.reconnect_base,
             reconnect_max=self.reconnect_max,
             max_reconnect_attempts=self.max_reconnect_attempts,
+            contention_pause=self.contention_pause,
+            contention_threshold=self.contention_threshold,
         )
         self.gateway.client_cache = self.cache
+        self.gateway.proxy = self.proxy or getattr(self.transport, "proxy", None)
         await self.gateway.start()
+        await self._announce_device_online()
         await self.dispatch(
             "ready",
             ReadyEvent(self.session.device_id, self.session.hub_url),
         )
+
+    async def _announce_device_online(self) -> None:
+        """Tell Root this device is Active, the way the desktop client does.
+
+        ``RootSession.initializeStartupServicesAsync`` ends with
+        ``SetDeviceOnlineStatusAsync(UserDeviceOnlineStatus.Active)`` and
+        ``initializeReconnectServicesAsync`` repeats it on every reconnect --
+        so a real client announces itself on each connection and rootpy never
+        did. A connection that never comes online is not one Root has any
+        reason to deliver to.
+
+        It measurably matters: in a paired probe, the DM-delivery control
+        *failed* on a connection that had not announced and *passed* (+0.5 s)
+        on one that had, same account, same process.
+
+        Best-effort. A failure here must not stop a gateway that is otherwise
+        working, so it is logged rather than raised.
+        """
+        try:
+            from .enums import UserOnlineStatus
+
+            await self.user_settings.set_device_online_status(
+                int(UserOnlineStatus.ACTIVE)
+            )
+        except Exception as exc:                      # noqa: BLE001
+            log.debug("could not announce device online status: %s", exc)
 
     async def start(
         self,
@@ -1315,13 +1577,18 @@ class RootClient(HighLevelMixin):
         await self.gateway.wait_closed()
 
     async def close(self) -> None:
-        try:
-            if getattr(self.calls, "active_session", None) is not None:
-                await self.calls.disconnect()
-            else:
-                await self.calls.stop_audio(close_peer=True)
-        except Exception:
-            pass
+        # Only touch voice if it was ever built. The else branch used to run
+        # when self._calls was None, calling stop_audio() on None -- an
+        # AttributeError on every close of a text-only client, swallowed by
+        # the except and therefore invisible.
+        if self._calls is not None:
+            try:
+                if getattr(self._calls, "active_session", None) is not None:
+                    await self._calls.disconnect()
+                else:
+                    await self._calls.stop_audio(close_peer=True)
+            except Exception:
+                pass
         if self.gateway is not None:
             await self.gateway.close()
             self.gateway = None
@@ -1361,7 +1628,9 @@ class RootClient(HighLevelMixin):
         password: Optional[str] = None,
     ) -> None:
         async def runner() -> None:
-            if self.auto_install_media:
+            if self.require_media:
+                # Opt-in: fail fast at startup rather than mid-call if the
+                # optional voice stack is not installed. Never installs.
                 from .media_bootstrap import ensure_media_dependencies
 
                 await asyncio.to_thread(ensure_media_dependencies)

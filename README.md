@@ -1,5 +1,9 @@
 # rootpy
 
+[![tests](https://github.com/solluws/rootpy/actions/workflows/tests.yml/badge.svg)](https://github.com/solluws/rootpy/actions/workflows/tests.yml)
+[![python](https://img.shields.io/badge/python-3.10%2B-blue)](pyproject.toml)
+[![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 An async Python client for the [Root](https://rootapp.com) chat platform.
 
 Reverse-engineered from the official desktop client, with the wire format
@@ -24,6 +28,11 @@ asyncio.run(main())
 
 ---
 
+> **Building with an AI assistant?** Paste
+> [`LLMS.md`](LLMS.md) into it first — it covers the mental model, what to use
+> when, the performance characteristics, and the protocol traps that are
+> impossible to guess.
+
 ## Contents
 
 - [Install](#install)
@@ -39,9 +48,11 @@ asyncio.run(main())
 - [Performance notes](#performance-notes)
 - [Hosting several accounts](#hosting-several-accounts)
 - [Included scripts](#included-scripts)
+- [Discovering the API](#discovering-the-api) — `explain` and `preview`, offline
 - [Adding a new RPC](#adding-a-new-rpc)
 - [Testing](#testing)
 - [Protocol notes](#protocol-notes)
+- [LLMS.md](LLMS.md) — context for AI assistants
 - [Responsible use](#responsible-use)
 
 ---
@@ -62,6 +73,15 @@ name, and it won't be found if your editor runs the script from a temp
 directory.
 
 ## Quick start
+
+The fastest way to see what's available:
+
+```bash
+python example.py --list                        # list the sections
+python example.py --token --only messages roles # run them
+```
+
+Or in code:
 
 ```python
 import asyncio
@@ -89,7 +109,10 @@ asyncio.run(main())
 ## Logging in
 
 There are five ways in, and they cost very different amounts. Measured on a
-real account (2 communities, ~330 ms per round trip):
+real account with 2 communities, on a slower connection than the live suite
+normally sees — ~330 ms a round trip against the ~190 ms in
+[Performance notes](#performance-notes) — so read the figures below as ratios
+rather than absolutes:
 
 | mode | how | requests | time | can receive events? |
 |---|---|---|---|---|
@@ -160,6 +183,11 @@ await channel.send("hello")
 # replies are threaded
 await message.reply("got it")
 
+# reply to up to 5 messages with one message
+await client.reply_to([first, second, third], "answering all three")
+await first.reply_with([second, third], "same thing")
+await channel.reply_to([msg_a, msg_b], "answering both")
+
 # edit, react, pin, delete
 await message.edit("updated text")
 await message.react("👍")
@@ -210,21 +238,57 @@ client.remove_listener("member_join", handler)
 
 ### Typed events
 
-These arrive as objects with resolved names where known, plus `.received_at`
-and `.raw`:
+These arrive as objects with resolved names where known, plus `.raw`. Every
+event built from a named packet — every row below *except* `on_message` — also
+carries `.received_at`, a timezone-aware `datetime`. `MessageEvent` does not:
+it comes off the gateway's own message path rather than the typed-event
+builder, and carries `.action` and `.sequence` instead:
 
 | event | object | useful fields |
 |---|---|---|
-| `on_message` | `MessageEvent` | `.message` |
+| `on_message` | `MessageEvent` | `.message`, `.action` (create/edit/delete), `.sequence` (`None` when the message came from a poll, not the socket) |
 | `on_friend_request`, `on_friend_remove` | `FriendEvent` | `user_id`, `username` |
-| `on_member_join`, `on_member_leave`, `on_member_ban` | `MemberEvent` | `user_id`, `username`, `community_id/name` |
+| `on_member_join`, `on_member_leave`, `on_member_ban`, `on_member_unban` | `MemberEvent` | `user_id`, `username`, `community_id/name`, `role_ids`, `presence` |
+| `on_member_online`, `on_member_offline` | `MemberEvent` | same fields, `presence=True` |
 | `on_role_add`, `on_role_remove` | `MemberRoleEvent` | `role_id`, `role_name`, `user_ids` |
 | `on_channel_create/_edit/_delete` | `ChannelEvent` | `name`, `category`, `community_name`, `is_text` |
-| `on_role_create`, `on_role_delete` | `RoleEvent` | `name`, `color_hex`, `mentionable` |
+| `on_role_create`, `on_role_edit`, `on_role_delete`, `on_role_move` | `RoleEvent` | `name`, `color_hex`, `mentionable`, `before_role_id` |
+| `on_reaction_add`, `on_reaction_remove` | `ReactionEvent` | `shortcode`, `message_id`, `user_id`, `container_id`, `is_direct` |
 | `on_block_add`, `on_block_remove` | `BlockEvent` | `user_id`, `username` |
 
-Every gateway packet is also dispatched raw as `on_packet_<name>` (91 packet
-types), with `pkt.fields` giving typed values and `pkt.get("field")` for one.
+**Presence is not membership.** `COMMUNITY_MEMBER_ATTACH` (5502) and
+`COMMUNITY_MEMBER_DETACH` (5503) are what a client sends when it opens or
+closes a community — the app feeds an attach straight into
+`SetAttached(userId, true, OnlineStatus)` — so they fire `on_member_online`
+and `on_member_offline`. Only the genuine membership packets
+`COMMUNITY_JOINED` and `COMMUNITY_LEAVE` fire `on_member_join` and
+`on_member_leave`. `MemberEvent.presence` tells the two families apart, so one
+handler can take both and branch. If you previously used `on_member_join` to
+notice people, you were watching *anyone opening the community*, not anyone
+joining it — that is the behaviour change.
+
+**`is_text` is three-valued on channel events**, not two. Only
+`ChannelCreatedPacket` carries `ChannelType` (field 12); the edited and deleted
+packets do not, so `ChannelEvent.is_text` returns `None` when nothing knows the
+type. The builder fills it in from the client's channel cache first — the
+gateway dispatches `packet` before a delete evicts the entry, so the cache is
+usually still warm — and only an uncached channel yields `None`. Test with
+`is True` / `is None`, not truthiness, or the unknown case reads as "not a
+text channel".
+
+**Reactions carry the container, not just the message.** One packet serves
+reaction add and remove, for channels and for direct messages alike, so
+`ReactionEvent.is_direct` says which kind `container_id` names. A direct-message
+reaction has no `community_id`; without that flag it would look like a channel
+reaction in a community you cannot look up.
+
+Every gateway packet is also dispatched raw as `on_packet_<name>`. There are 90
+of those: `PacketType` has 91 members, but `UNKNOWN` is guarded out of the
+`on_packet_*` fan-out and arrives as `on_unknown_packet` instead, so a packet
+this library has never seen still reaches you. `pkt.fields` gives typed values
+and `pkt.get("field")` fetches one; `pkt.fields["packet_type"]` is the app's own
+`PacketType` on every packet, which is how a role edit (5402) is told apart
+from a role create (5401).
 
 ### Waiting for something
 
@@ -266,8 +330,25 @@ for member in await client.get_members_detailed(community_id):
     print(member.username, member.about_me)
     print(member.avatar_url, member.banner_uri, member.custom_status)
 
-# or a single user's profile
+# asset URIs -> real https links
 profile = await client.get_profile(user_id)
+
+url = await client.asset_url(profile.banner_uri)       # best available size
+urls = await client.asset_urls([uri1, uri2, uri3])     # many, batched
+
+# full detail: every size Root offers, plus expiry
+asset = await client.get_asset(profile.avatar_url)
+asset.best_url            # highest resolution
+asset.url_for_size(128)   # smallest link at least 128px across
+asset.links               # [AssetLink(url, max_dimension, width, height), ...]
+asset.expires_at          # these links are short-lived
+asset.is_animated
+
+# links expire, so keep the bytes if you need them permanently
+await client.save_asset(profile.avatar_url, "avatars/alice")   # -> avatars/alice.png
+await client.save_profile_images(profile, "images/")
+
+# or a single user's profile
 profiles = await client.get_profiles([id1, id2, id3])   # one request
 
 # pick someone at random -- excludes you, and comes with their profile
@@ -276,8 +357,13 @@ print(member.user_id, member.username)
 print(member.avatar_url, member.banner_uri, member.about_me)
 await member.add_role(role_id)                              # member actions too
 
-member = await client.get_random_member(community_id, with_profile=False)  # id only
-three  = await client.get_random_members(community_id, 3)
+# several at once -- profiles fetched in ONE batched request
+for member in await client.get_random_members(community_id, 5):
+    print(member.username, member.about_me)
+
+# ids only, no profile requests
+member = await client.get_random_member(community_id, with_profile=False)
+three  = await client.get_random_members(community_id, 3, with_profile=False)
 
 await member.add_role(role_id)
 await member.kick()
@@ -286,7 +372,7 @@ await member.kick()
 channel = await client.community_admin.create_channel(
     community_id, group_id, "new-channel", channel_type=1,   # 1 = TEXT
 )
-role = await client.community_admin.create_role(community_id, "New Role")
+role = await client.community_admin.create_role(community_id, "New-Role")
 await client.roles.add_to_members(community_id, role.id, [user_id])
 
 await channel.delete()
@@ -359,25 +445,59 @@ await client.change_banner("banner.png")                     # same source types
 
 ## Watching for new messages
 
-Root pushes mentions and DMs, but **not** ordinary channel messages. To see
-everything, `watch_unread()` combines both: it uses each channel's
-`last_activity_at` vs `user_last_viewed_at` (the same signal behind the unread
-dot in the official client) to spot changes, then fetches only what changed.
+Root pushes mentions and DMs to any connected account. **Channel messages push
+too — but only for communities you have attached.** Membership is not a
+subscription: until you attach, the hub sends nothing for that community, which
+is what makes a listener look broken when it is merely unsubscribed.
+
+`UnreadReader` handles all of it — attach, listen, read, clear:
 
 ```python
-await client.connect()          # mentions/DMs arrive instantly
-client.watch_unread(interval=3.0, include_dms=True)
+from rootpy import UnreadReader
 
-@client.event
-async def on_message(event):
-    print(event.message.content)   # both sources land here, deduplicated
+await client.connect()
+
+async def handle(message):
+    print(message.content)
+
+async with UnreadReader(client, on_message=handle):
+    await asyncio.Event().wait()
 ```
 
-One `GetExtended` per community per sweep, run concurrently; only channels
-whose activity advanced get a message fetch. Mentions are instant; ordinary
-channel messages appear within roughly `interval` seconds.
+It attaches to every community you are in, does one pass to clear whatever went
+unread while it was down, and then **makes no requests at all** until something
+arrives. Measured on 3 communities × 3 channels with a second account posting:
+**9/9 read, median 0.22 s**, one request per message — the click, not a poll.
+`devscripts/unreadtest.py` runs that scenario end to end.
 
-To watch a single channel instead: `client.watch_channel(channel_id)`.
+Two things worth knowing:
+
+- **Attaching is visible.** Other members see you as present in the community
+  (`COMMUNITY_MEMBER_ATTACH`). `UnreadReader` detaches again on exit; pass
+  `detach_on_stop=False` to stay attached, or `attach=False` to never do it.
+- **The subscription lives with the hub connection**, so it has to be redone
+  after a reconnect. The reader watches for that and re-attaches itself.
+
+If you need to stay out of the presence list, the older polling path is still
+there: `client.watch_unread(interval=3.0)` sweeps `last_activity_at` vs
+`user_last_viewed_at` instead, one `GetExtended` per community per tick. To
+watch a single channel that way: `client.watch_channel(channel_id)`.
+
+### Built on this: the ophanim project
+
+Three tools that use this library rather than being part of it live in a
+separate folder, `visjs/`:
+
+| | |
+|---|---|
+| `ophanim/ophanim.py` | archives every message and major event to `ophanim.json`, and indexes activity — messages/day, active users/day, density |
+| `ophanim/accounts.py` | every member of every community the account can reach, with about-mes and roles |
+| `ophanim/discover.py` | finds communities the account is *not* in, from invite links in archived messages and about-mes |
+| the site | a zero-dependency Node app over all of it, plus this library's own surface |
+
+They are kept out of this repository's root on purpose: they are an
+application, they need credentials, and their output contains real message
+content. See `visjs/README.md`.
 
 ---
 
@@ -400,6 +520,49 @@ except GrpcWebError as exc:
     print(format_root_error(exc, verbose=True))
 ```
 
+`error_code` is a named `ErrorCodeType` — 50 of them, including the two WebRTC
+refusals `WEB_RTC_BACKEND_MISMATCH` (6000) and `WEB_RTC_CALL_BANNED` (6001). A
+code Root has added since this library was generated comes back as the plain
+integer rather than raising, so `exc.error_code` is always safe to print.
+
+`RootError` is the base worth catching for anything this library *defines*: all
+54 of its exception classes descend from it — including the four that used to
+sit outside the tree:
+`CallActionError` (the base of the in-call moderation refusals from
+`user.mute(ctx)` / `user.kick(ctx)`, and now exported from `rootpy` directly),
+`CommandError`, `MediaDependencyMissing` and `AlreadyCreatedError`. Being
+refused a mute is a routine outcome, not a bug, so it has to be catchable
+alongside the wire errors. Nothing that caught them before stopped working:
+`CallActionError` and `MediaDependencyMissing` kept `RuntimeError` as a second
+base, so an existing `except RuntimeError` around a mute or a missing `[voice]`
+extra still catches what it caught before, and the other two were plain
+`Exception` subclasses that `RootError` still satisfies:
+
+```python
+from rootpy import RootError
+
+try:
+    await user.kick(ctx)
+except RootError as exc:      # GrpcWebError, MissingPermissions, rate limits, ...
+    print(exc)
+```
+
+It is not a universal catch-all, though, and that snippet is a good place to see
+why. Where no typed class exists the library still raises a plain
+`RuntimeError`: `connect()` without a session, `wait_until_ready()` before
+connect, `user.kick(ctx)` with no active call — the very call above, outside a
+call — and the "server answered with something we can't parse" paths in
+`auth.py` and the service modules. A transport failure that outlives
+`max_retries` is re-raised as the underlying `httpx` exception
+(`TimeoutException`, `NetworkError`, `RemoteProtocolError`) rather than wrapped.
+That escape applies inside an active call too — `user.kick(ctx)` reaches the
+wire through `calls.kick` like any other request — so the snippet above is
+narrower than it looks. Argument validation escapes as well, before a request
+is ever made: `messages.send("not-a-guid", ...)` raises a plain `ValueError`.
+There is no short tuple that covers all of it. `except Exception` is the only
+true backstop; [LLMS.md §11](LLMS.md) has the counts and says which layer
+raises what.
+
 Rate limits are handled for you: a `429` records a per-endpoint cooldown that
 *all* callers respect, rather than each retrying into the same wall.
 
@@ -407,7 +570,14 @@ Rate limits are handled for you: a `429` records a per-endpoint cooldown that
 
 ## Performance notes
 
-Measured against a live account, ~330 ms per round trip:
+Measured against a live account. The most recent timing pass averaged **~190 ms**
+round trip over ~850 calls — 188–199 across three runs, 332 tests at the time of
+the measurement and 347 now. That supersedes the ~213 ms over 496 calls this
+section used to quote, which is the earlier run; [LLMS.md §19](LLMS.md) carries
+both and says which is which. Read every total as of its own run — the live
+suite keeps growing — and note that the per-call figure moved too, so it is not
+the stable part either. The login numbers below were taken on a slower
+connection at ~330 ms, so read those as ratios rather than absolutes:
 
 - **Login:** lazy ~966 ms, eager ~2596 ms. Community expansion is the cost, and
   since those calls run concurrently the saving stays roughly constant as
@@ -451,18 +621,58 @@ Each account stays **independent**: its own client, handlers, credentials,
 rate-limit budget, and failures. A bad token or a disconnect on one account
 doesn't disturb the others — `host.status()` reports each one separately.
 
+To do the *same* thing as every account, `broadcast` an action. It returns one
+outcome per account and **never raises**, because partial success ("3 of 5
+joined") is the normal case for a fan-out, not an exception — an account that
+cannot join answers with a refusal, and that must not cost you the other
+results:
+
+```python
+host = MultiClientHost.from_tokens([TOKEN_A, TOKEN_B])
+async with host:
+    results = await host.broadcast(lambda c: c.invites.join(code))
+    for outcome in results.values():
+        print(outcome)  # "account1: ok" / "account2: GrpcUnauthenticated: ..."
+```
+
+`broadcast` runs the accounts concurrently (HTTP/2 multiplexes, so N accounts
+cost barely more wall time than one — measured at **1.10x** for a two-account
+fan-out against a single call, 190 ms vs 172 ms) and sequentially *within* each
+account; `only=`, `concurrency=` and `timeout=` bound it. `host.join(code)` is
+the named shorthand for the example above.
+
+> **Which refusal you get is not what you would guess.** Root answers
+> `UNAUTHENTICATED (16)` both for an account that is *already a member* and for
+> the community's own *owner* — not `ALREADY_EXISTS`. A genuinely bad code
+> answers `NOT_FOUND (5)`, so the two cases are still distinguishable; just
+> match on the exception type rather than assuming. Verified live in
+> `tests/test_live_broadcast.py`.
+
 Two options worth knowing:
 
 - `gateway=False` per account skips the websocket for accounts that only make
   API calls, saving a connection and the keepalive traffic.
-- `shared_transport=True` puts every account on one connection pool. It's off
-  by default on purpose: a shared pool also shares the rate-limit cooldown
-  table, so one account's `429` would pause everyone else's calls to that
-  endpoint.
+- `shared_transport` is **on by default**: every account shares one connection
+  pool, so the host pays the ~831 ms TLS + HTTP/2 handshake once rather than once
+  per account. The rate-limit cooldown table is keyed *per account*, so one
+  account's `429` no longer stalls the others — that shared-cooldown coupling is
+  the only reason it used to default off. Pass `shared_transport=False` for hard
+  socket isolation.
 
 `multihost.py` is a ready-to-run version reading accounts from `accounts.txt`.
 
 ---
+
+## Routing through a proxy
+
+Optional, off by default:
+
+```python
+client = RootClient(token=TOKEN, proxy="socks5://127.0.0.1:1080")
+```
+
+Applies to the API and the gateway. `socks5://` needs
+`pip install "httpx[socks]"`; proxying the websocket needs `websockets >= 13`.
 
 ## Where the time goes
 
@@ -493,20 +703,67 @@ counters so you can measure one specific operation.
 
 ---
 
+## Project layout
+
+```
+rootpy/          the library — Python, plus data/ (below); nothing else ships
+                 in the wheel
+rootpy/data/     five generated JSON registries, ~1.1 MB
+example.py       guided tour of the whole SDK
+examples/        two short focused examples
+devscripts/      testing, benchmarking, protocol diagnostics
+tests/           1880 offline tests, plus 347 live (see Testing)
+docs/            reference and protocol notes
+```
+
+`rootpy/data/` is not optional. `enums.json`, `messages.json`,
+`message_schemas.json`, `rpc_services.json` and `services.json` are the
+decompiled protocol registries every schema lookup reads, which is why
+`pyproject.toml` declares them as package data — *"Without this the wheel
+installs but every schema lookup raises at runtime."* They are produced by
+external tooling; there is no generator script in this repository, so treat
+them as inputs rather than build products.
+
+Scripts in `examples/` and `devscripts/` run whether or not you've installed
+the package — they add the project root to `sys.path` themselves.
+
 ## Included scripts
 
-| script | what it does |
-|---|---|
-| `example.py` | live monitor — prints every message/event, INFO concise, DEBUG verbose |
-| `fullrun.py` | 30-step end-to-end test of the whole SDK, with timings |
-| `twotest.py` | two accounts: one sends, one watches — verifies delivery + latency |
-| `benchmark.py` | eager vs lazy login, per account, per endpoint |
-| `logintimes.py` | times all five login modes |
-| `sendone.py` | send one message in a single request |
-| `diagnose.py` | RPC troubleshooter — isolates a failing call |
-| `multihost.py` | runs several accounts in one process |
+**`example.py`** is the one to start with — a guided tour of the whole SDK. It
+logs in (or creates an account), builds its **own sandbox community**, then
+demonstrates channels, roles, members, messages, DMs, friends, presence,
+assets and live events inside it, and deletes it again. Your existing servers
+are never touched.
 
-Each reads credentials from `tokens.txt` next to it:
+```bash
+python example.py                       # menu: use a token, or create an account
+python example.py --token               # log in from tokens.txt, run everything
+python example.py --token --only messages roles
+python example.py --list                # what the sections are
+python example.py --token --keep        # leave the sandbox community behind
+```
+
+Everything else lives in [`devscripts/`](devscripts/) — testing, benchmarking
+and the protocol diagnostics:
+
+| | |
+|---|---|
+| `fullrun.py` | 39-step lifecycle test with timings |
+| `twotest.py` | two accounts: one sends, one watches |
+| `monitor.py` | live monitor for one account |
+| `benchmark.py` · `logintimes.py` | login cost, measured |
+| `multihost.py` · `sendone.py` | many accounts in one process; single-request send |
+| `diagnose.py` · `signupdebug.py` · `assetdiag.py` | RPC troubleshooting |
+| `useraccounts.py` | scrape member profiles to CSV |
+
+And two short ones in [`examples/`](examples/):
+
+| | |
+|---|---|
+| `quickstart.py` | the smallest useful bot |
+| `auto_react.py` | react to every message matching a rule |
+
+Credentials come from `tokens.txt` (in the project root or beside the script):
 
 ```
 token=<your token>
@@ -515,9 +772,40 @@ watcher=<for twotest.py>
 sender=<for twotest.py>
 ```
 
-**Never commit `tokens.txt` or `accounts.txt`** — it's in `.gitignore`, keep it that way.
+**Never commit `tokens.txt` or `accounts.json`** — both are in `.gitignore`.
 
----
+## Discovering the API
+
+The structured layer knows the exact wire shape of every RPC. Two methods put
+that a keystroke away, and neither touches the network:
+
+```python
+client.explain()                          # index of managers and wire services
+client.explain("file")                    # every method of a wire service
+client.explain("file.search")             # one method's request fields
+client.explain("community_files.search")  # a friendly manager method + its wire call
+```
+
+`explain` takes a name the way you'd spell it — a manager (`community_files`), a
+wire service (`file`), or a `service.method` in either — and shows the Python
+signature and the wire fields together. The manager-to-wire link is read from
+the code itself, so it never drifts from what the method actually sends.
+
+`preview` encodes a request and shows what would go on the wire **without
+sending it**:
+
+```python
+client.preview("message.create", container_id=cid, content="hi")
+# preview  message.create   (encoded, NOT sent)
+#   request   MessageCreateRequest  ->  response MessageCreateResponse
+#   wire body 48 bytes  (53 framed)
+#   ...
+```
+
+Because it runs the real encoder, an unknown field or a malformed value (a bad
+GUID) raises *here*, offline — so a preview that encodes is a call you know is
+well-formed, for the price of zero round trips. Both return an object that
+prints itself and carries `.as_dict()` for programmatic use.
 
 ## Adding a new RPC
 
@@ -559,16 +847,56 @@ field 10, wire type 2.
 ## Testing
 
 ```bash
-python -m pytest tests/ -q
+pip install -e ".[dev]"
+pytest -q                      # 1880 offline: no token, no network
 ```
 
-51 tests, each one locking in a bug that was expensive to find:
+Live tests need a real account. They create a community they own, work inside
+it, and delete it afterwards — no ids are hard-coded, and everything created is
+named `rootpy test*` so debris from a crashed run is easy to find.
 
-- `test_wire.py` — request framing (the big one)
-- `test_protocol_schemas.py` — packet types, enums, error payloads
-- `test_client_behaviour.py` — dedup, cursors, request shape, channel filtering
-- `test_features.py` — typed events, `wait_for`, presence, object methods, rate limits
-- `test_cache_and_history.py` — caching, lazy init, history pagination
+```bash
+export ROOT_TOKEN="..."
+pytest -m live -v              # 225 tests
+
+export ROOT_TOKEN2="..."       # a second account
+pytest -m live2 -v             # 122 more: DMs, calls, friend requests,
+                               # moderation, and the broadcast fan-out
+pytest -m "live or live2" -v   # 347
+```
+
+**214 of 237 service methods (90%) are exercised against the live API** —
+`devscripts/covermap.py` walks the call graph out of every live test and says
+so. `--strict` drops the edges it resolved by a colliding method name
+(`list`, `create`, `get`) rather than by service, and reports 205 (86%). Run
+both: the truth is between them, and the gap is how much of the number is
+inference.
+[LLMS.md §18](LLMS.md) has the per-service breakdown and, more importantly,
+an honest list of what is *not* covered.
+
+The second account matters more than it sounds. One account can send a DM and
+see it in its own history, but only a second one proves it was *delivered* —
+and every bug that hid behind that was silent rather than loud.
+
+### Two extra tools
+
+```bash
+pytest -m "live or live2" --timing --timing-json=t.json
+```
+
+Per-test milliseconds, split into round trip, rate-limit waiting and client
+work using the SDK's own counters. A live run is ~82% network at ~190 ms a call,
+which is the answer to "why is this slow" most of the time.
+
+```bash
+python devscripts/soak.py --selftest                        # offline, ~1s
+python devscripts/soak.py --stress 300 --reconnect-every 25 # ~4 min
+```
+
+Two accounts messaging each other under forced reconnects, checking that every
+message actually arrives, exactly once. Tracks delivery, latency, cache size,
+live object counts and memory. Run `--selftest` first — it proves the
+measurement itself is flat before you trust anything it reports.
 
 ---
 
@@ -579,17 +907,74 @@ Findings that aren't obvious from the API:
 - **The gateway is a resync cycle**, not a persistent stream. It sends a batch,
   closes with code `1000`, and expects you to reconnect. That's normal, not an
   error.
-- **Mentions and DMs are pushed; ordinary channel messages are not.** A
-  notification embeds the whole originating message — content, author, and the
-  author's display name.
-- **`MessageList` must not include `Limit`**, and must always include `DateAt`.
-  Sending `Limit` is rejected.
+- **Membership does not subscribe you; `Attach` does.** Until you call
+  `client.community.attach(id)` the hub sends *nothing* for that community — no
+  message, no channel edit — while DMs, mentions and status changes keep
+  arriving on the same socket. After the attach a channel post shows up as a
+  `message` event in ~0.2 s. The desktop client does this when it fully loads a
+  community and detaches on unload, which is why it only sees live traffic for
+  communities it has opened. `UnreadReader` attaches for you.
+- **Attaching is visible.** The server broadcasts `COMMUNITY_MEMBER_ATTACH`
+  (5502) and clients show attached members as present in the community.
+- **Mentions and DMs are pushed with no attach at all.** A notification embeds
+  the whole originating message — content, author, and the author's display
+  name.
+- **`MessageList` must always include `DateAt`. `Limit` is optional, and when
+  present must be 10–50 inclusive** — Root answers
+  `Limit: Must be between 10 and 50 [InclusiveBetweenValidator]` otherwise.
+  Omitting it returns 50. `messages.list` and `messages.history` range-check it
+  locally, so a bad `page_size` fails once rather than on every page.
 - **Usernames aren't on messages or members** — only `User` objects carry them.
   The cache learns names from notification payloads.
 - **`UserOnlineStatus.ACTIVE` is `0x10`**, not a small integer.
 - **Channel `ContainerId` equals its `Id`.**
+- **Signup: the Turnstile token is field 3**, not field 7 (that's `AccessToken`).
+  Get this wrong and the server keeps issuing challenges, which looks exactly
+  like your tokens being rejected.
+- **Signup retries must reuse the device id.** The challenge is bound to the
+  request; a new device id makes the retry a different signup.
+- **Asset links expire** — `AssetGet` returns signed Cloudflare Images URLs
+  with an `exp`, so store bytes rather than URLs for anything lasting.
 
 ---
+
+## Creating test accounts
+
+Signup is gated by a Cloudflare Turnstile challenge. This library doesn't try
+to get around that — you solve the challenge and pass the token in:
+
+```python
+from rootpy import AccountFactory
+
+factory = AccountFactory(email_pattern="hello-{tag}@solluw.com")
+# one-shot
+account = await factory.create(turnstile_token=TOKEN)
+
+# or as three explicit steps, with the solving left to you
+challenge_url = await factory.create_return_turnstile(username="bob")
+token         = my_own_solver(challenge_url)          # your code
+account       = await factory.create_with_turnstile(
+                    turnstile_token=token, challenge=challenge_url)
+
+factory.save("accounts.json")      # private! it's in .gitignore
+
+# new accounts start unverified, but signup already emailed the code — read it
+# from your own mail server and submit it. Don't call send_verification(): the
+# resend is behind a *second* Turnstile challenge (action=resend_verification)
+# that the token you solved for the signup doesn't satisfy.
+code = await read_from_your_mailbox(account.email)   # signup sent it
+await factory.verify(account, code)
+
+# or in one call — it polls your mailbox for the code signup already sent
+account = await factory.create_and_verify(
+              turnstile_token=TOKEN, code_provider=read_from_your_mailbox)
+```
+
+Keeping every account on one email pattern means the whole set can be found
+and removed in one sweep — which is usually the condition attached to
+permission for this. See [docs/accounts.md](docs/accounts.md), and
+[docs/two-step-signup.md](docs/two-step-signup.md) for the step-by-step flow
+and the rules that break it.
 
 ## Responsible use
 
@@ -608,4 +993,4 @@ Not affiliated with or endorsed by Root.
 
 ## License
 
-Add one before publishing — MIT is the usual choice for something like this.
+MIT — see [LICENSE](LICENSE).

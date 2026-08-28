@@ -2,6 +2,7 @@
 object methods, and rate-limit awareness."""
 
 import asyncio
+import time
 
 import pytest
 
@@ -63,6 +64,165 @@ def test_typed_events_are_built_from_packets():
     assert seen["channel"].name == "general"
     assert seen["channel"].is_text
     assert seen["friend"].received_at is not None
+
+
+def test_role_move_is_a_typed_event():
+    """COMMUNITY_ROLE_MOVED reaches on_role_move, with the ordering payload.
+
+    The slot had no route, so the event never fired even though SUBROUTES
+    listed ``5404: role_move`` -- for slot 90, which cannot carry a move.
+    ``before_role_id`` is the whole point of the event: without it you know a
+    role moved but not where to.
+    """
+    async def run():
+        client = RootClient()
+        seen = {}
+
+        @client.event
+        async def on_role_move(event):
+            seen["move"] = event
+
+        await client.dispatch("packet", _packet(
+            "COMMUNITY_ROLE_MOVED",
+            {"packet_type": 5404, "community_id": "c1", "id": "r-moved",
+             "before_community_role_id": "r-anchor"},
+        ))
+        await asyncio.sleep(0.05)
+        await client.close()
+        return seen
+
+    seen = asyncio.run(run())
+    assert seen["move"].role_id == "r-moved"
+    assert seen["move"].before_role_id == "r-anchor"
+    assert seen["move"].community_id == "c1"
+
+
+def test_a_role_move_to_the_top_has_no_anchor():
+    """An absent field 6 means "first", not "unknown"."""
+    from rootpy.typed_events import TypedEventBuilder
+
+    class _Client:
+        communities = {}
+        channels = {}
+        cache = None
+
+    built = TypedEventBuilder(_Client()).build(_packet(
+        "COMMUNITY_ROLE_MOVED",
+        {"packet_type": 5404, "community_id": "c1", "id": "r-moved"},
+    ))
+    assert built is not None
+    name, event = built
+    assert name == "role_move"
+    assert event.before_role_id == ""
+
+
+def test_role_delete_reads_its_own_field_name():
+    """CommunityRoleDeletedPacket names field 4 ``community_role_id``.
+
+    The builder read only ``id``, so every real delete arrived with an empty
+    role_id. Both spellings must work: the create/move slots use ``id``.
+    """
+    from rootpy.typed_events import TypedEventBuilder
+
+    class _Client:
+        communities = {}
+        channels = {}
+        cache = None
+
+    _, event = TypedEventBuilder(_Client()).build(_packet(
+        "COMMUNITY_ROLE_DELETED",
+        {"packet_type": 5403, "community_id": "c1",
+         "community_role_id": "r-gone"},
+    ))
+    assert event.role_id == "r-gone"
+
+
+@pytest.mark.parametrize("packet_type,expected,is_direct", [
+    (5801, "reaction_add", False),
+    (5802, "reaction_remove", False),
+    (204, "reaction_add", True),
+    (205, "reaction_remove", True),
+])
+def test_reactions_split_by_packet_type(packet_type, expected, is_direct):
+    """One slot, one packet class, four meanings.
+
+    MESSAGE_REACTION (173) carries channel add/remove (5801/5802) and DM
+    add/remove (204/205). Routing on the slot alone cannot tell a removed
+    reaction from a new one, nor a DM from a channel.
+    """
+    from rootpy.typed_events import TypedEventBuilder
+
+    class _Client:
+        communities = {}
+        channels = {}
+        cache = None
+
+    fields = {"packet_type": packet_type, "container_id": "k1",
+              "shortcode": ":thumbsup:", "message_id": "m1",
+              "user_id": "u1"}
+    if not is_direct:
+        fields["community_id"] = "c1"
+
+    name, event = TypedEventBuilder(_Client()).build(
+        _packet("MESSAGE_REACTION", fields)
+    )
+    assert name == expected
+    assert event.is_direct is is_direct
+    assert event.shortcode == ":thumbsup:"
+    assert event.message_id == "m1"
+    assert event.container_id == "k1"
+
+
+def test_a_reaction_without_a_decoded_packet_type_falls_back():
+    """No field 1 means we guess from the absent community, not crash."""
+    from rootpy.typed_events import TypedEventBuilder
+
+    class _Client:
+        communities = {}
+        channels = {}
+        cache = None
+
+    name, event = TypedEventBuilder(_Client()).build(_packet(
+        "MESSAGE_REACTION",
+        {"container_id": "d1", "shortcode": "x", "message_id": "m1",
+         "user_id": "u1"},
+    ))
+    assert name == "reaction_add"
+    assert event.is_direct is True
+
+
+def test_reaction_events_reach_a_handler():
+    async def run():
+        client = RootClient()
+        seen = {}
+
+        @client.event
+        async def on_reaction_add(event):
+            seen["add"] = event
+
+        @client.event
+        async def on_reaction_remove(event):
+            seen["remove"] = event
+
+        await client.dispatch("packet", _packet(
+            "MESSAGE_REACTION",
+            {"packet_type": 5801, "community_id": "c1", "container_id": "ch1",
+             "shortcode": ":fire:", "message_id": "m1", "user_id": "u1"},
+        ))
+        await client.dispatch("packet", _packet(
+            "MESSAGE_REACTION",
+            {"packet_type": 205, "container_id": "dm1", "shortcode": ":wave:",
+             "message_id": "m2", "user_id": "u2"},
+        ))
+        await asyncio.sleep(0.05)
+        await client.close()
+        return seen
+
+    seen = asyncio.run(run())
+    assert seen["add"].shortcode == ":fire:"
+    assert seen["add"].is_direct is False
+    assert seen["remove"].shortcode == ":wave:"
+    assert seen["remove"].is_direct is True
 
 
 def test_unmapped_packets_do_not_raise():
@@ -207,7 +367,19 @@ def test_channel_send_uses_its_own_ids():
 
 
 # --- rate limiting -------------------------------------------------------- #
-def test_rate_limit_cooldown_is_shared():
+def test_rate_limit_cooldown_is_per_account():
+    """A 429 cools an endpoint down for *that account only*.
+
+    The cooldown map lives on the transport, and a ``MultiClientHost`` shares
+    one transport across accounts (it saves the ~831 ms TLS/HTTP-2 handshake
+    per account). Keying the cooldown by endpoint alone meant one account's
+    429 stalled every account on the pool. It is keyed by account as well now
+    (see ``GrpcWebTransport._account_scope``), which is what makes a shared
+    transport safe -- and is why sharing is the host default.
+
+    So the assertion is the opposite of what it once was: A's cooldown holds
+    A and does *not* hold B, even though they share the transport.
+    """
     async def run():
         transport = GrpcWebTransport()
 
@@ -218,6 +390,7 @@ def test_rate_limit_cooldown_is_shared():
                 self.content = b""
                 self.text = ""
 
+        # One 429 for the first call, then everyone succeeds.
         responses = [
             _Response(429, {"retry-after": "0.25"}),
             _Response(200, {"grpc-status": "0"}),
@@ -231,21 +404,43 @@ def test_rate_limit_cooldown_is_shared():
 
         transport._get_client = lambda: _Client()
         endpoint = "https://api.rootapp.com/root.v2.MessageGrpcService/List"
-        await transport.unary(
-            endpoint=endpoint, body=b"\x08\x01", headers={}, operation="T"
-        )
-        assert "root.v2.MessageGrpcService/List" in transport._cooldowns
+        headers_a = {"authorization": "Bearer AAA"}
+        headers_b = {"authorization": "Bearer BBB"}
+        key_a = transport._cooldown_key(endpoint, headers_a)
+        key_b = transport._cooldown_key(endpoint, headers_b)
 
-        # a later call must wait rather than pile on
+        # A's 429 records a cooldown under A's scoped key -- not the bare
+        # endpoint (that would stall everyone), and not B's.
+        await transport.unary(
+            endpoint=endpoint, body=b"\x08\x01", headers=headers_a, operation="T"
+        )
+        assert key_a in transport._cooldowns
+        assert key_b not in transport._cooldowns
+        assert "root.v2.MessageGrpcService/List" not in transport._cooldowns
+        assert key_a != key_b
+
         loop = asyncio.get_running_loop()
-        transport._cooldowns["root.v2.MessageGrpcService/List"] = loop.time() + 0.3
+
+        # A later call *as A* waits its own cooldown out rather than piling on.
+        transport._cooldowns[key_a] = loop.time() + 0.3
         started = loop.time()
         await transport.unary(
-            endpoint=endpoint, body=b"\x08\x01", headers={}, operation="T"
+            endpoint=endpoint, body=b"\x08\x01", headers=headers_a, operation="T"
         )
-        return loop.time() - started
+        a_waited = loop.time() - started
 
-    assert asyncio.run(run()) >= 0.25
+        # ...while B, sharing the very same transport, does not inherit it.
+        transport._cooldowns[key_a] = loop.time() + 0.3
+        started = loop.time()
+        await transport.unary(
+            endpoint=endpoint, body=b"\x08\x01", headers=headers_b, operation="T"
+        )
+        b_waited = loop.time() - started
+        return a_waited, b_waited
+
+    a_waited, b_waited = asyncio.run(run())
+    assert a_waited >= 0.25          # A holds for its own cooldown
+    assert b_waited < 0.1            # B is untouched by A's cooldown
 
 
 # --- friend requests ------------------------------------------------------ #
@@ -353,6 +548,8 @@ def test_documented_api_surface_exists():
     check("cache", all(hasattr(client.cache, n) for n in
           ("username", "member", "stats")))
     check("send_once", hasattr(RootClient, "send_once"))
+    check("discovery", all(hasattr(RootClient, n) for n in
+          ("explain", "preview", "describe_services")))
 
     assert not missing, f"README documents missing APIs: {missing}"
 
@@ -402,8 +599,18 @@ def test_unknown_attribute_still_raises():
 
 # --- multi-account host --------------------------------------------------- #
 def test_host_runs_accounts_independently():
-    """Each account gets its own client, handlers, and rate-limit budget."""
-    async def run():
+    """Each account gets its own client and handlers, and a bad token does not
+    take down the others.
+
+    The transport is *shared* by default now: one TLS/HTTP-2 handshake for the
+    whole host rather than one per account (~831 ms each, measured). That used
+    to cost rate-limit isolation, because the cooldown table rode along with
+    the pool -- so the old default was a transport per account. It no longer
+    does (cooldowns are keyed per account; see ``test_rate_limit_cooldown_is_
+    per_account``), which makes sharing safe. ``shared_transport=False`` still
+    gives each account its own pool for callers who want hard socket isolation.
+    """
+    async def run(host_kwargs):
         import rootpy
         from rootpy import MultiClientHost
         from rootpy.models import CurrentUser
@@ -423,27 +630,35 @@ def test_host_runs_accounts_independently():
         rootpy.RootClient.login_token = fake_login
         rootpy.RootClient.connect = fake_connect
         try:
-            host = MultiClientHost(stagger=0.0)
+            host = MultiClientHost(stagger=0.0, **host_kwargs)
             host.add("good1", "t1")
             host.add("broken", "bad")
             host.add("good2", "t2")
             await host.start()
             ready = await host.wait_ready(timeout=5)
-            transports = {
-                id(a.client.transport)
-                for a in host.accounts.values() if a.client
-            }
+            clients = [a.client for a in host.accounts.values() if a.client]
+            transports = {id(c.transport) for c in clients}
+            client_ids = {id(c) for c in clients}
             await host.stop()
-            return ready, len(transports)
+            return ready, len(transports), len(client_ids)
         finally:
             rootpy.RootClient.login_token = original_login
             rootpy.RootClient.connect = original_connect
 
-    ready, transport_count = asyncio.run(run())
-    # a bad token must not take down the others
+    # default (shared_transport unspecified): one shared transport, but three
+    # independent clients. The default itself is the contract under test.
+    ready, transport_count, client_count = asyncio.run(run({}))
+    assert ready["good1"] and ready["good2"]     # a bad token must not ...
+    assert not ready["broken"]                   # ... take down the others
+    assert client_count == 3                     # each account its own client
+    assert transport_count == 1                  # sharing one pool by default
+
+    # opt-out: hard socket isolation, one transport per account
+    ready, transport_count, client_count = asyncio.run(
+        run({"shared_transport": False})
+    )
     assert ready["good1"] and ready["good2"]
     assert not ready["broken"]
-    # separate transports => one account's 429 can't stall another
     assert transport_count == 3
 
 
@@ -457,6 +672,66 @@ def test_host_rejects_duplicate_names():
     except ValueError:
         return
     raise AssertionError("expected ValueError for a duplicate account name")
+
+
+def test_broadcast_returns_an_outcome_per_account_and_never_raises():
+    """A fan-out's partial success is a set of results, not an exception.
+
+    Every requested account gets exactly one Outcome: a value on success, and a
+    captured error -- never a raise -- whether the account failed to log in or
+    the action itself threw. ``only=`` restricts the set.
+    """
+    async def run():
+        import rootpy
+        from rootpy import MultiClientHost
+        from rootpy.models import CurrentUser
+
+        original_login = rootpy.RootClient.login_token
+        original_connect = rootpy.RootClient.connect
+
+        async def fake_login(self):
+            await asyncio.sleep(0.01)
+            if self.token == "bad":
+                raise RuntimeError("invalid token")
+            self.user = CurrentUser(id="me", username=self.token)
+
+        async def fake_connect(self):
+            await asyncio.sleep(0.01)
+
+        rootpy.RootClient.login_token = fake_login
+        rootpy.RootClient.connect = fake_connect
+        try:
+            host = MultiClientHost(stagger=0.0)
+            host.add("good1", "t1", gateway=False)
+            host.add("broken", "bad", gateway=False)
+            host.add("good2", "t2", gateway=False)
+            await host.start()
+            await host.wait_ready(timeout=5)
+
+            async def action(client):
+                if client.user.username == "t2":
+                    raise ValueError("boom")     # captured on the outcome
+                return client.user.username
+
+            results = await host.broadcast(action)
+            only = await host.broadcast(action, only=["good1"])
+            await host.stop()
+            return results, only
+        finally:
+            rootpy.RootClient.login_token = original_login
+            rootpy.RootClient.connect = original_connect
+
+    results, only = asyncio.run(run())
+    # one outcome per requested account; the call itself never raised
+    assert set(results) == {"good1", "broken", "good2"}
+    assert results["good1"].ok and results["good1"].value == "t1"
+    # an account that never became ready is a failed outcome, not a silent skip
+    assert not results["broken"].ok
+    # an exception raised inside the action lands on that account's outcome
+    assert not results["good2"].ok
+    assert isinstance(results["good2"].error, ValueError)
+    # only= restricts the fan-out to the named accounts
+    assert set(only) == {"good1"} and only["good1"].value == "t1"
 
 
 # --- profile picture ------------------------------------------------------ #
@@ -759,6 +1034,167 @@ def test_members_detailed_batches_requests():
     assert requests == 3          # ceil(250/100), not 250
 
 
+def _detailed_client(member_count, *, on_request=None):
+    """A client whose community has ``member_count`` members and a fake wire."""
+    from rootpy.models import Community, CommunityExtended, CommunityMember
+
+    community_id = "00000000-0000-00aa-0000-000000000002"
+
+    def uid(index):
+        return f"00000000-0000-{index:04x}-0000-000000000001"
+
+    client = RootClient(token="x")
+    client.users._token_getter = lambda: "x"
+    members = tuple(
+        CommunityMember(uid(i), (), b"", community_id, client)
+        for i in range(member_count)
+    )
+
+    async def fetch(cid):
+        extended = CommunityExtended(
+            Community(id=cid, name="S", owner_user_id=uid(0),
+                      default_channel_id=None),
+            (), members, (), b"",
+        )
+        client._community_extended[cid] = extended
+        return extended
+
+    class _Response:
+        content = b""
+
+    async def fake_unary(**kwargs):
+        if on_request is not None:
+            await on_request()
+        return _Response()
+
+    client.fetch_community = fetch
+    client.users.transport.unary = fake_unary
+    return client, community_id
+
+
+def test_members_detailed_default_batch_is_500_not_100():
+    """The default was measured, so pin it -- 100 cost 316 requests live.
+
+    A round trip costs ~190 ms whether it carries 1 id or 200, and Root
+    accepted 4,000 in one call, so a small batch buys nothing and costs a
+    request each time. 2,000 members should be 4 requests, not 20.
+    """
+    async def run():
+        client, cid = _detailed_client(2000)
+        calls = {"n": 0}
+
+        original = client.users.transport.unary
+
+        async def counting(**kwargs):
+            calls["n"] += 1
+            return await original(**kwargs)
+
+        client.users.transport.unary = counting
+        detailed = await client.get_members_detailed(cid)
+        await client.close()
+        return len(detailed), calls["n"]
+
+    count, requests = asyncio.run(run())
+    assert count == 2000
+    assert requests == 4, f"expected ceil(2000/500)=4 requests, got {requests}"
+
+
+def test_members_detailed_runs_its_batches_concurrently():
+    """The expensive half was the ``for`` loop, not the batch size.
+
+    Serial, eight 50 ms batches take 400 ms; concurrent they take ~50 ms.
+    Measured against a fake wire so this cannot fail because Root was busy --
+    what is under test is whether the batches are issued together at all.
+    """
+    async def run():
+        client, cid = _detailed_client(4000)   # 8 batches at the 500 default
+
+        in_flight = {"now": 0, "peak": 0}
+
+        async def slow():
+            in_flight["now"] += 1
+            in_flight["peak"] = max(in_flight["peak"], in_flight["now"])
+            await asyncio.sleep(0.05)
+            in_flight["now"] -= 1
+
+        client.users.transport.unary = _replacing_unary(client, slow)
+
+        started = time.perf_counter()
+        detailed = await client.get_members_detailed(cid)
+        elapsed = time.perf_counter() - started
+        await client.close()
+        return len(detailed), elapsed, in_flight["peak"]
+
+    count, elapsed, peak = asyncio.run(run())
+    assert count == 4000
+    assert peak > 1, (
+        "profile batches were issued one at a time -- peak in-flight was "
+        f"{peak}, so the gather is not gathering"
+    )
+    assert elapsed < 0.3, (
+        f"8 batches of 50 ms took {elapsed*1000:.0f} ms; serial would be ~400 ms"
+    )
+
+
+def test_members_detailed_concurrency_one_is_still_serial():
+    """The escape hatch: ``concurrency=1`` restores the old behaviour."""
+    async def run():
+        client, cid = _detailed_client(4000)
+        in_flight = {"now": 0, "peak": 0}
+
+        async def slow():
+            in_flight["now"] += 1
+            in_flight["peak"] = max(in_flight["peak"], in_flight["now"])
+            await asyncio.sleep(0.01)
+            in_flight["now"] -= 1
+
+        client.users.transport.unary = _replacing_unary(client, slow)
+        await client.get_members_detailed(cid, concurrency=1)
+        await client.close()
+        return in_flight["peak"]
+
+    assert asyncio.run(run()) == 1
+
+
+def test_members_detailed_survives_a_failed_batch():
+    """One bad batch costs its own members' profiles, not everyone else's."""
+    async def run():
+        client, cid = _detailed_client(1500)   # 3 batches at the 500 default
+        seen = {"n": 0}
+
+        class _Response:
+            content = b""
+
+        async def flaky(**kwargs):
+            seen["n"] += 1
+            if seen["n"] == 2:
+                raise RuntimeError("batch 2 is having a bad day")
+            return _Response()
+
+        client.users.transport.unary = flaky
+        detailed = await client.get_members_detailed(cid)
+        await client.close()
+        return len(detailed), seen["n"]
+
+    count, requests = asyncio.run(run())
+    # every member still comes back -- the failed batch's members just carry
+    # profile=None, which DetailedMember already degrades to.
+    assert count == 1500
+    assert requests == 3, f"a failed batch stopped the others: {requests}"
+
+
+def _replacing_unary(client, hook):
+    """A fake ``transport.unary`` that runs ``hook()`` per request."""
+    class _Response:
+        content = b""
+
+    async def fake(**kwargs):
+        await hook()
+        return _Response()
+
+    return fake
+
+
 def test_detailed_member_exposes_profile_fields():
     from rootpy.models import CommunityMember, DetailedMember, UserProfile
 
@@ -867,8 +1303,8 @@ def test_get_random_member_returns_none_when_empty():
 def test_get_random_members_is_distinct_and_capped():
     async def run():
         client, cid, _uid = _client_with_n_members(count=5)
-        three = await client.get_random_members(cid, 3)
-        too_many = await client.get_random_members(cid, 99)
+        three = await client.get_random_members(cid, 3, with_profile=False)
+        too_many = await client.get_random_members(cid, 99, with_profile=False)
         await client.close()
         return three, too_many
 
@@ -992,3 +1428,983 @@ def test_timing_report_is_readable_and_resettable():
     assert "GetSelf" in report
     assert before == 1
     assert after == 0
+
+
+def test_no_undefined_lazy_names():
+    """Making the heavy APIs lazy removed their top-level imports -- every
+    remaining use must import them locally, or it's a NameError at runtime."""
+    import ast
+    import pathlib
+
+    lazy_names = {"StructuredAPI", "RawAPI", "StructuredService"}
+    problems = []
+
+    for path in pathlib.Path("rootpy").rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+
+        # Names available module-wide: imports AND classes defined here.
+        module_level = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    module_level.add(alias.asname or alias.name.split(".")[0])
+            elif isinstance(node, ast.ClassDef):
+                module_level.add(node.name)
+
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            used = {
+                n.id for n in ast.walk(node)
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
+            } & lazy_names
+            if not used:
+                continue
+            local = set()
+            for inner in ast.walk(node):
+                if isinstance(inner, (ast.Import, ast.ImportFrom)):
+                    for alias in inner.names:
+                        local.add(alias.asname or alias.name)
+            missing = used - local - module_level
+            if missing:
+                problems.append(f"{path}:{node.name} uses {sorted(missing)}")
+
+    assert not problems, "undefined lazy names: " + "; ".join(problems)
+
+
+def test_random_members_plural_matches_singular():
+    """Both return the same shape -- a bare CommunityMember from the plural
+    version was an easy trap (AttributeError on .username)."""
+    async def run():
+        from rootpy.models import UserProfile
+
+        client, cid, _uid = _client_with_n_members(count=10)
+        calls = {"n": 0}
+
+        async def fake_profiles(ids):
+            calls["n"] += 1
+            return {
+                user_id: UserProfile(
+                    user_id=user_id, username="alice",
+                    profile_picture_uri="asset://p", banner_uri="asset://b",
+                    description="about",
+                )
+                for user_id in ids
+            }
+
+        async def fake_profile(user_id):
+            return (await fake_profiles([user_id]))[user_id]
+
+        client.get_profiles = fake_profiles
+        client.get_profile = fake_profile
+
+        one = await client.get_random_member(cid)
+        many = await client.get_random_members(cid, 5)
+        batched = calls["n"]
+        await client.close()
+        return one, many, batched
+
+    one, many, batched = asyncio.run(run())
+    # the same attributes work on both
+    for member in (one, *many):
+        assert member.user_id
+        assert member.username == "alice"
+        assert member.avatar_url == "asset://p"
+        assert member.banner_uri == "asset://b"
+        assert member.about_me == "about"
+    assert len(many) == 5
+    # five members cost one batched profile request, not five
+    assert batched == 2          # one for the singular call, one for the batch
+
+
+# --- asset URLs ----------------------------------------------------------- #
+def test_asset_uris_resolve_to_real_urls():
+    """Decoded per AssetInformationReflection: AssetInformation{1 url,
+    2 image{10 asset_links{10 url, 11 largest_dimension_limit, 12 w, 13 h}}}."""
+    async def run():
+        from rootpy.protocol import grpc_frame
+
+        def varint(value):
+            out = bytearray()
+            while True:
+                byte = value & 0x7F
+                value >>= 7
+                out.append(byte | (0x80 if value else 0))
+                if not value:
+                    return bytes(out)
+
+        def tag(field, wire):
+            return varint((field << 3) | wire)
+
+        def text(field, value):
+            raw = value.encode()
+            return tag(field, 2) + varint(len(raw)) + raw
+
+        def msg(field, data):
+            return tag(field, 2) + varint(len(data)) + bytes(data)
+
+        def num(field, value):
+            return tag(field, 0) + varint(value)
+
+        def link(url, limit, width, height):
+            return msg(
+                10,
+                text(10, url) + num(11, limit) + num(12, width) + num(13, height),
+            )
+
+        uri = "root://asset/ADCzZmV6ixu9hCMumghlAAoFaW1hZ2U"
+        image = (
+            link("https://cdn.root/small.png", 128, 128, 128)
+            + link("https://cdn.root/big.png", 1024, 1024, 1024)
+            + num(13, 1)                       # is_animated
+        )
+        info = (
+            text(1, "https://cdn.root/original.png")
+            + msg(2, image)
+            + msg(10, num(1, 1786900000))      # link_expires_at
+        )
+        body = grpc_frame(msg(2, text(1, uri) + msg(2, info)))
+
+        client = RootClient(token="x")
+        client.assets._token_getter = lambda: "x"
+
+        class _Response:
+            content = body
+
+        async def fake_unary(**kwargs):
+            return _Response()
+
+        client.assets.transport.unary = fake_unary
+        asset = await client.get_asset(uri)
+        urls = await client.asset_urls([uri])
+        passthrough = await client.asset_urls(["https://already/x.png"])
+        await client.close()
+        return asset, urls, passthrough, uri
+
+    asset, urls, passthrough, uri = asyncio.run(run())
+    assert asset.url == "https://cdn.root/original.png"
+    assert [link.max_dimension for link in asset.links] == [128, 1024]
+    assert asset.best_url == "https://cdn.root/big.png"
+    assert asset.url_for_size(100) == "https://cdn.root/small.png"
+    assert asset.url_for_size(900) == "https://cdn.root/big.png"
+    assert asset.is_animated is True
+    assert asset.expires_at == 1786900000
+    assert asset.width == 1024 and asset.height == 1024
+    assert urls[uri] == "https://cdn.root/big.png"
+    # already-usable URLs come back untouched, without a request
+    assert passthrough["https://already/x.png"] == "https://already/x.png"
+
+
+def test_asset_resolve_handles_empty_input():
+    async def run():
+        client = RootClient(token="x")
+        result = await client.asset_urls([])
+        await client.close()
+        return result
+
+    assert asyncio.run(run()) == {}
+
+
+def test_asset_decode_matches_live_response_shape():
+    """Built from a real AssetGet dump: the response carries BOTH the legacy
+    map (field 1, AssetImage) and the assets map (field 2, AssetInformation).
+    Mishandling the legacy entry once made the whole call return nothing."""
+    async def run():
+        from rootpy.protocol import grpc_frame
+
+        def varint(value):
+            out = bytearray()
+            while True:
+                byte = value & 0x7F
+                value >>= 7
+                out.append(byte | (0x80 if value else 0))
+                if not value:
+                    return bytes(out)
+
+        def tag(field, wire):
+            return varint((field << 3) | wire)
+
+        def text(field, value):
+            raw = value.encode()
+            return tag(field, 2) + varint(len(raw)) + raw
+
+        def msg(field, data):
+            return tag(field, 2) + varint(len(data)) + bytes(data)
+
+        def num(field, value):
+            return tag(field, 0) + varint(value)
+
+        uri = "root://asset/ADCzZmV6ixu9hCMumghlAAoFaW1hZ2U"
+        base = "https://imagedelivery.net/o8EZ/350c2ec6/"
+
+        def link(name, limit, width, height):
+            return msg(
+                10,
+                text(10, base + name) + num(11, limit)
+                + num(12, width) + num(13, height),
+            )
+
+        image = (
+            link("placeholder", 32, 32, 32)
+            + link("public", 2048, 256, 256)
+            + link("small", 512, 256, 256)
+            + link("thumbnail", 128, 128, 128)
+            + msg(11, b"\x00" * 20)                 # web_p blob
+            + msg(12, num(1, 1) + num(2, 1))        # aspect ratio
+        )
+        information = (
+            msg(2, image)
+            + msg(10, num(1, 1789084447) + num(2, 845779500))   # expiry
+        )
+        payload = (
+            msg(1, text(1, uri) + msg(2, image))            # legacy map
+            + msg(2, text(1, uri) + msg(2, information))    # assets map
+        )
+
+        client = RootClient(token="x")
+        client.assets._token_getter = lambda: "x"
+
+        class _Response:
+            content = grpc_frame(payload)
+
+        async def fake_unary(**kwargs):
+            return _Response()
+
+        client.assets.transport.unary = fake_unary
+        asset = await client.get_asset(uri)
+        url = await client.asset_url(uri)
+        await client.close()
+        return asset, url
+
+    asset, url = asyncio.run(run())
+    assert asset is not None, "legacy map entry must not break decoding"
+    assert [link.max_dimension for link in asset.links] == [32, 128, 512, 2048]
+    assert asset.best_url.endswith("public")
+    assert asset.url_for_size(100).endswith("thumbnail")
+    assert asset.expires_at and asset.expires_at > 1_700_000_000
+    assert url.endswith("public")
+
+
+# --- account factory ------------------------------------------------------ #
+def test_account_factory_lets_the_server_demand_the_captcha():
+    """Don't guess locally: attempt signup and let Root raise
+    TurnstileRequired with its real challenge URL, which is the URL the user
+    actually needs to open."""
+    async def run():
+        import rootpy
+        from rootpy import AccountFactory
+        from rootpy.exceptions import TurnstileRequired
+
+        original = rootpy.RootClient.create_account
+        seen = []
+
+        async def fake(cls, *, username, password, email, access_token=None, **kw):
+            seen.append(access_token)
+            if not access_token:
+                raise TurnstileRequired(
+                    "https://challenges.cloudflare.com/turnstile/v0/REAL", "signup"
+                )
+            raise AssertionError("should not get here in this test")
+
+        rootpy.RootClient.create_account = classmethod(fake)
+        try:
+            factory = AccountFactory(email_pattern="hello-{tag}@example.com")
+            try:
+                await factory.create()          # no token at all
+            except TurnstileRequired as exc:
+                return exc.challenge_url, seen
+            return None, seen
+        finally:
+            rootpy.RootClient.create_account = original
+
+    challenge_url, seen = asyncio.run(run())
+    assert challenge_url == "https://challenges.cloudflare.com/turnstile/v0/REAL"
+    assert seen == [None]        # the attempt really went out without a token
+
+
+def test_account_factory_uses_the_configured_domain():
+    async def run():
+        from types import SimpleNamespace
+
+        import rootpy
+        from rootpy import AccountFactory
+
+        seen = []
+
+        class _Client:
+            user = SimpleNamespace(id="uid")
+            user_id = "uid"
+            session = SimpleNamespace(token="tok")
+
+            async def close(self):
+                pass
+
+        original = rootpy.RootClient.create_account
+
+        async def fake(cls, *, username, password, email, access_token=None,
+                       turnstile_token=None, **kw):
+            seen.append((username, email, turnstile_token))
+            return _Client()
+
+        rootpy.RootClient.create_account = classmethod(fake)
+        try:
+            factory = AccountFactory(
+                email_pattern="hello-{tag}@solluw.com", username_prefix="test",
+            )
+            account = await factory.create(turnstile_token="cf-token")
+            return account, seen, factory
+        finally:
+            rootpy.RootClient.create_account = original
+
+    account, seen, factory = asyncio.run(run())
+    assert account.email.startswith("hello-")
+    assert account.email.endswith("@solluw.com")
+    assert account.username.startswith("test")
+    assert seen[0][2] == "cf-token"          # the token is actually sent
+    assert factory.emails() == [account.email]
+
+
+def test_account_factory_rejects_a_pattern_without_tag():
+    from rootpy import AccountFactory
+
+    try:
+        AccountFactory(email_pattern="hello@solluw.com")
+    except ValueError:
+        return
+    raise AssertionError("expected ValueError for a pattern without {tag}")
+
+
+def test_saved_accounts_can_be_redacted(tmp_path):
+    from rootpy.accounts import AccountFactory, CreatedAccount
+
+    factory = AccountFactory(email_pattern="hello-{tag}@solluw.com")
+    factory.accounts.append(
+        CreatedAccount(
+            username="test1", password="hunter2",
+            email="hello-abc@solluw.com", token="secret-token",
+        )
+    )
+    public = tmp_path / "accounts.public.json"
+    factory.save(public, include_secrets=False)
+    text = public.read_text(encoding="utf-8")
+    assert "hunter2" not in text
+    assert "secret-token" not in text
+    assert "hello-abc@solluw.com" in text
+
+
+def test_account_verification_flow():
+    """Create -> send code -> poll your mailbox -> verify."""
+    async def run():
+        from types import SimpleNamespace
+
+        import rootpy
+        from rootpy import AccountFactory
+
+        calls = {"sent": [], "verified": []}
+
+        class _Client:
+            user = SimpleNamespace(id="uid")
+            user_id = "uid"
+            session = SimpleNamespace(token="tok-abc")
+
+            async def close(self):
+                pass
+
+        originals = (
+            rootpy.RootClient.create_account,
+            rootpy.RootClient.send_email_verification,
+            rootpy.RootClient.verify_email,
+        )
+
+        async def fake_create(cls, *, username, password, email,
+                              access_token=None, **kw):
+            return _Client()
+
+        async def fake_send(cls, username=None, password=None, *,
+                            token=None, turnstile_token=None):
+            calls["sent"].append(token)
+
+        async def fake_verify(cls, code, username=None, password=None, *,
+                              token=None):
+            calls["verified"].append(code)
+
+        rootpy.RootClient.create_account = classmethod(fake_create)
+        rootpy.RootClient.send_email_verification = classmethod(fake_send)
+        rootpy.RootClient.verify_email = classmethod(fake_verify)
+        try:
+            factory = AccountFactory(email_pattern="hello-{tag}@solluw.com")
+            attempts = {"n": 0}
+
+            async def code_provider(email):
+                attempts["n"] += 1
+                return "123456" if attempts["n"] >= 2 else None
+
+            account = await factory.create_and_verify(
+                turnstile_token="cf-token", code_provider=code_provider,
+                timeout=5, poll_interval=0.02,
+            )
+            return account, calls, factory
+        finally:
+            (rootpy.RootClient.create_account,
+             rootpy.RootClient.send_email_verification,
+             rootpy.RootClient.verify_email) = originals
+
+    account, calls, factory = asyncio.run(run())
+    assert account.verified is True
+    # No resend by default. Signup already emails the code, and the resend is
+    # gated behind its own Turnstile challenge (action=resend_verification)
+    # that the signup token does not satisfy -- so doing it unasked raised
+    # TurnstileRequired and lost the freshly minted credentials. This assertion
+    # used to read ["tok-abc"], which was the defect written down as an
+    # expectation. Opting in is covered by the test below.
+    assert calls["sent"] == []
+    assert calls["verified"] == ["123456"]
+    assert factory.unverified() == []
+
+
+def test_account_verification_can_opt_into_a_resend():
+    """``resend=True`` is the only way to trigger send_email_verification."""
+    async def run():
+        from types import SimpleNamespace
+
+        import rootpy
+        from rootpy import AccountFactory
+
+        calls = {"sent": [], "verified": []}
+
+        class _Client:
+            user = SimpleNamespace(id="uid")
+            user_id = "uid"
+            session = SimpleNamespace(token="tok-abc")
+
+            async def close(self):
+                pass
+
+        originals = (
+            rootpy.RootClient.create_account,
+            rootpy.RootClient.send_email_verification,
+            rootpy.RootClient.verify_email,
+        )
+
+        async def fake_create(cls, *, username, password, email,
+                              access_token=None, **kw):
+            return _Client()
+
+        async def fake_send(cls, username=None, password=None, *,
+                            token=None, turnstile_token=None):
+            calls["sent"].append(token)
+
+        async def fake_verify(cls, code, username=None, password=None, *,
+                              token=None):
+            calls["verified"].append(code)
+
+        rootpy.RootClient.create_account = classmethod(fake_create)
+        rootpy.RootClient.send_email_verification = classmethod(fake_send)
+        rootpy.RootClient.verify_email = classmethod(fake_verify)
+        try:
+            factory = AccountFactory(email_pattern="hello-{tag}@solluw.com")
+
+            async def code_provider(email):
+                return "123456"
+
+            await factory.create_and_verify(
+                turnstile_token="cf-token", code_provider=code_provider,
+                timeout=5, poll_interval=0.02, resend=True,
+            )
+            return calls
+        finally:
+            (rootpy.RootClient.create_account,
+             rootpy.RootClient.send_email_verification,
+             rootpy.RootClient.verify_email) = originals
+
+    calls = asyncio.run(run())
+    assert calls["sent"] == ["tok-abc"]
+    assert calls["verified"] == ["123456"]
+
+
+def test_account_left_unverified_when_no_code_arrives():
+    """A missing code must not lose the account -- verify it later."""
+    async def run():
+        from types import SimpleNamespace
+
+        import rootpy
+        from rootpy import AccountFactory
+
+        class _Client:
+            user = SimpleNamespace(id="uid")
+            user_id = "uid"
+            session = SimpleNamespace(token="tok")
+
+            async def close(self):
+                pass
+
+        originals = (
+            rootpy.RootClient.create_account,
+            rootpy.RootClient.send_email_verification,
+        )
+
+        async def fake_create(cls, **kw):
+            return _Client()
+
+        async def fake_send(cls, *a, **kw):
+            pass
+
+        rootpy.RootClient.create_account = classmethod(fake_create)
+        rootpy.RootClient.send_email_verification = classmethod(fake_send)
+        try:
+            factory = AccountFactory(email_pattern="hello-{tag}@solluw.com")
+
+            async def never(email):
+                return None
+
+            account = await factory.create_and_verify(
+                turnstile_token="t", code_provider=never,
+                timeout=0.1, poll_interval=0.02,
+            )
+            return account, factory
+        finally:
+            (rootpy.RootClient.create_account,
+             rootpy.RootClient.send_email_verification) = originals
+
+    account, factory = asyncio.run(run())
+    assert account.verified is False
+    assert account.username and account.email     # still recorded
+    assert len(factory.unverified()) == 1
+
+
+def test_signup_uses_connect_service_field_numbers():
+    """Signup goes to connect.ConnectService/PasswordSignUp, which has its own
+    numbering -- NOT root.UserGrpcService/SignUp's. Using the wrong schema
+    makes every field miss and the server answers INVALID_ARGUMENT."""
+    async def run():
+        from rootpy.auth import AuthClient
+        from rootpy.protocol import iter_fields, unwrap_grpc_web
+
+        captured = {}
+
+        class _Transport:
+            async def unary(self, *, endpoint, body, headers, operation):
+                captured["body"] = body
+                captured["endpoint"] = endpoint
+                raise RuntimeError("stop")
+
+        auth = AuthClient.__new__(AuthClient)
+        auth.transport = _Transport()
+        try:
+            await AuthClient.signup(
+                auth, "someuser", "password", "hello-abc@solluw.com",
+                turnstile_token="0.TOKEN",
+            )
+        except RuntimeError:
+            pass
+        payload = unwrap_grpc_web(captured["body"]) or captured["body"]
+        fields = {
+            number: bytes(value)
+            for number, wire, value in iter_fields(payload) if wire == 2
+        }
+        return captured["endpoint"], fields
+
+    endpoint, fields = asyncio.run(run())
+    assert "ConnectService/PasswordSignUp" in endpoint
+    assert fields[1] == b"someuser"
+    assert fields[2] == b"password"
+    assert fields[6] == b"hello-abc@solluw.com"
+    # field 3 is TurnstileToken; field 7 is AccessToken -- different things.
+    # Sending the captcha as 7 means the server never sees it and keeps
+    # issuing challenges, which looks like the token being rejected.
+    assert fields[3] == b"0.TOKEN"
+    assert 7 not in fields
+    assert 4 in fields and 5 in fields   # device description + id
+
+
+def test_signup_reuses_the_device_id_across_a_challenge_retry():
+    """Root binds the Turnstile challenge to the request. A fresh device id on
+    the retry reads as a different signup, so the server mints a new challenge
+    and the token you just solved is never checked."""
+    async def run():
+        from rootpy.auth import AuthClient
+        from rootpy.identifiers import create_desktop_device_guid
+        from rootpy.protocol import (
+            decode_root_guid_message, iter_fields, unwrap_grpc_web,
+        )
+
+        seen = []
+
+        class _Transport:
+            async def unary(self, *, endpoint, body, headers, operation):
+                payload = unwrap_grpc_web(body) or body
+                for number, wire, value in iter_fields(payload):
+                    if number == 5 and wire == 2:
+                        seen.append(decode_root_guid_message(bytes(value)))
+                raise RuntimeError("stop")
+
+        auth = AuthClient.__new__(AuthClient)
+        auth.transport = _Transport()
+
+        # without an explicit id, each call invents its own
+        for _ in range(2):
+            try:
+                await AuthClient.signup(auth, "u", "p", "e@x.com")
+            except RuntimeError:
+                pass
+        drifting = seen.copy()
+
+        # passing one through keeps it stable, which is what the retry needs
+        seen.clear()
+        device_id = create_desktop_device_guid()
+        for token in (None, "0.SOLVED"):
+            try:
+                await AuthClient.signup(
+                    auth, "u", "p", "e@x.com",
+                    turnstile_token=token, device_id=device_id,
+                )
+            except RuntimeError:
+                pass
+        return drifting, seen
+
+    drifting, stable = asyncio.run(run())
+    assert drifting[0] != drifting[1]      # a fresh id per call by default
+    assert stable[0] == stable[1]          # and stable when supplied
+
+
+# --- two-step signup ------------------------------------------------------ #
+def _two_step_harness():
+    """Patch create_account to demand a challenge, then accept a token."""
+    from types import SimpleNamespace
+
+    import rootpy
+    from rootpy.exceptions import TurnstileRequired
+
+    calls = []
+    original = rootpy.RootClient.create_account
+
+    class _Client:
+        def __init__(self, username):
+            self.user = SimpleNamespace(id=f"uid-{username}")
+            self.user_id = f"uid-{username}"
+            self.session = SimpleNamespace(token="tok")
+
+        async def close(self):
+            pass
+
+    async def fake(cls, *, username, password, email,
+                   turnstile_token=None, device_id=None, **kw):
+        calls.append(
+            {"username": username, "password": password, "email": email,
+             "device_id": device_id, "token": turnstile_token}
+        )
+        if not turnstile_token:
+            raise TurnstileRequired(
+                "https://infra.rootapp.com/ts.html?sitekey=0x4A"
+                "&action=password_signup&cdata=ABC123",
+                "password_signup",
+            )
+        return _Client(username)
+
+    rootpy.RootClient.create_account = classmethod(fake)
+    return calls, original
+
+
+def test_two_step_signup_reuses_every_detail():
+    """Step 3 must repeat the username, password, email AND device id from
+    step 1, or Root mints a new challenge and never checks the token."""
+    async def run():
+        import rootpy
+        from rootpy import AccountFactory
+
+        calls, original = _two_step_harness()
+        try:
+            factory = AccountFactory(email_pattern="hello-{tag}@solluw.com")
+            challenge = await factory.create_return_turnstile(username="bob")
+            account = await factory.create_with_turnstile(
+                turnstile_token="1.SOLVED", challenge=challenge,
+            )
+            return challenge, account, calls
+        finally:
+            rootpy.RootClient.create_account = original
+
+    challenge, account, calls = asyncio.run(run())
+
+    # the challenge behaves as a plain string
+    assert isinstance(challenge, str)
+    assert challenge.startswith("https://")
+    assert "cdata=ABC123" in challenge
+
+    # ...and carries the context
+    assert challenge.username == "bob"
+    assert challenge.email.endswith("@solluw.com")
+    assert challenge.device_id
+
+    # both attempts are the SAME signup
+    first, second = calls
+    assert first["username"] == second["username"]
+    assert first["password"] == second["password"]
+    assert first["email"] == second["email"]
+    assert first["device_id"] == second["device_id"]     # the critical one
+    assert first["token"] is None and second["token"] == "1.SOLVED"
+
+    assert account.username == "bob"
+    assert account.device_id == first["device_id"]
+
+
+def test_two_step_refuses_without_context():
+    """Finishing without the step-1 details is a clear error, not a silent
+    new challenge."""
+    async def run():
+        from rootpy import AccountFactory
+
+        factory = AccountFactory(email_pattern="hello-{tag}@solluw.com")
+        try:
+            await factory.create_with_turnstile(turnstile_token="1.SOLVED")
+            return None
+        except ValueError as exc:
+            return str(exc)
+
+    message = asyncio.run(run())
+    assert message and "device_id" in message
+
+
+def test_two_step_handles_no_challenge_needed():
+    """If Root doesn't demand a challenge the account is created there and
+    then -- surfaced as AlreadyCreatedError, with the account attached."""
+    async def run():
+        from types import SimpleNamespace
+
+        import rootpy
+        from rootpy import AccountFactory, AlreadyCreatedError
+
+        original = rootpy.RootClient.create_account
+
+        class _Client:
+            user = SimpleNamespace(id="uid")
+            user_id = "uid"
+            session = SimpleNamespace(token="tok")
+
+            async def close(self):
+                pass
+
+        async def fake(cls, **kw):
+            return _Client()
+
+        rootpy.RootClient.create_account = classmethod(fake)
+        try:
+            factory = AccountFactory(email_pattern="hello-{tag}@solluw.com")
+            try:
+                await factory.create_return_turnstile(username="bob")
+                return None
+            except AlreadyCreatedError as done:
+                return done.account, factory
+        finally:
+            rootpy.RootClient.create_account = original
+
+    result = asyncio.run(run())
+    assert result is not None
+    account, factory = result
+    assert account.username == "bob"
+    assert factory.accounts == [account]      # recorded, not lost
+
+
+# --- multi-reply ---------------------------------------------------------- #
+def _reply_harness():
+    from rootpy.models import Message
+
+    channel_id = "00000000-0000-00c1-0000-000000000003"
+    community_id = "00000000-0000-00aa-0000-000000000002"
+
+    def mid(index):
+        return f"00000000-0000-{index:04x}-0000-000000000001"
+
+    client = RootClient(token="x")
+    client.messages._token_getter = lambda: "x"
+    captured = {}
+
+    class _Response:
+        content = b"\x00\x00\x00\x00\x00"
+
+    async def fake_unary(**kwargs):
+        captured["body"] = kwargs["body"]
+        return _Response()
+
+    client.messages.transport.unary = fake_unary
+
+    def parents():
+        from rootpy.protocol import (
+            decode_root_guid_message, iter_fields, unwrap_grpc_web,
+        )
+
+        payload = unwrap_grpc_web(captured["body"]) or captured["body"]
+        return [
+            decode_root_guid_message(bytes(value))
+            for number, wire, value in iter_fields(payload)
+            if number == 14 and wire == 2
+        ]
+
+    messages = [
+        Message(id=mid(i), container_id=channel_id, user_id="u",
+                content=str(i), community_id=community_id,
+                _service=client.messages)
+        for i in range(3)
+    ]
+    return client, messages, parents, channel_id, community_id
+
+
+def test_reply_to_several_messages_at_once():
+    async def run():
+        client, messages, parents, _cid, _comm = _reply_harness()
+        await client.reply_to(messages, "answering all three")
+        result = parents()
+        await client.close()
+        return result
+
+    assert len(asyncio.run(run())) == 3
+
+
+def test_message_reply_with_includes_itself():
+    async def run():
+        client, messages, parents, _cid, _comm = _reply_harness()
+        await messages[0].reply_with(messages[1:], "and again")
+        result = parents()
+        await client.close()
+        return result
+
+    assert len(asyncio.run(run())) == 3      # self + the two others
+
+
+def test_channel_reply_to():
+    async def run():
+        from rootpy.models import Channel
+
+        client, messages, parents, channel_id, community_id = _reply_harness()
+        channel = Channel(
+            id=channel_id, community_id=community_id, channel_group_id="g",
+            name="general", channel_type=1, _client=client,
+        )
+        await channel.reply_to(messages[:2], "two")
+        result = parents()
+        await client.close()
+        return result
+
+    assert len(asyncio.run(run())) == 2
+
+
+def test_single_reply_still_sends_one_parent():
+    async def run():
+        client, messages, parents, _cid, _comm = _reply_harness()
+        await messages[0].reply("just one")
+        result = parents()
+        await client.close()
+        return result
+
+    assert len(asyncio.run(run())) == 1
+
+
+def test_reply_targets_normalise_and_dedupe():
+    from rootpy.models import Message
+    from rootpy.services.messages import normalise_reply_targets
+
+    def mid(index):
+        return f"00000000-0000-{index:04x}-0000-000000000001"
+
+    message = Message(id=mid(1), container_id="c", user_id="u",
+                      content="x", community_id=None)
+
+    assert len(normalise_reply_targets([mid(1), mid(2)])) == 2      # bare ids
+    assert len(normalise_reply_targets(message)) == 1               # not a list
+    assert len(normalise_reply_targets([message, message])) == 1    # deduped
+    assert normalise_reply_targets(None) == []
+
+
+def test_reply_target_limit_is_enforced():
+    """Root rejects the whole send past 5, without saying why -- fail here
+    with a clear message instead."""
+    from rootpy.services.messages import MAX_REPLY_TARGETS, normalise_reply_targets
+
+    assert MAX_REPLY_TARGETS == 5
+    too_many = [f"00000000-0000-{i:04x}-0000-000000000001" for i in range(6)]
+    try:
+        normalise_reply_targets(too_many)
+    except ValueError as exc:
+        assert "at most 5" in str(exc)
+        return
+    raise AssertionError("expected ValueError for 6 reply targets")
+
+
+# --- optional proxy ------------------------------------------------------- #
+def test_proxy_is_optional_and_off_by_default():
+    from rootpy.transport import GrpcWebTransport
+
+    client = RootClient(token="x")
+    assert client.proxy is None
+    assert client.transport.proxy is None
+    assert GrpcWebTransport().proxy is None
+
+
+def test_proxy_reaches_the_transport_and_gateway():
+    client = RootClient(token="x", proxy="socks5://127.0.0.1:1080")
+    assert client.proxy == "socks5://127.0.0.1:1080"
+    assert client.transport.proxy == "socks5://127.0.0.1:1080"
+
+
+def test_supplied_transport_keeps_its_own_proxy():
+    """Passing a transport means you configured it -- don't override it."""
+    from rootpy.transport import GrpcWebTransport
+
+    transport = GrpcWebTransport(proxy="socks5://127.0.0.1:1081")
+    client = RootClient(token="x", transport=transport)
+    assert client.transport.proxy == "socks5://127.0.0.1:1081"
+
+
+def test_each_client_can_use_a_different_proxy():
+    """Several accounts, each out of a different tunnel."""
+    clients = [
+        RootClient(token=f"t{i}", proxy=f"socks5://127.0.0.1:{1080 + i}")
+        for i in range(4)
+    ]
+    assert [c.transport.proxy for c in clients] == [
+        "socks5://127.0.0.1:1080", "socks5://127.0.0.1:1081",
+        "socks5://127.0.0.1:1082", "socks5://127.0.0.1:1083",
+    ]
+    # and they don't share a connection pool
+    assert len({id(c.transport) for c in clients}) == 4
+
+
+def test_account_factory_routes_signup_through_its_proxy():
+    """A factory-level proxy must reach create_account, or signup goes out
+    direct while everything else is tunnelled -- which looks like the proxy
+    working until you check the exit IP."""
+    async def run():
+        import rootpy
+        from rootpy import AccountFactory
+        from rootpy.exceptions import TurnstileRequired
+
+        captured = {}
+        original = rootpy.RootClient.create_account
+
+        async def fake(cls, **kwargs):
+            captured.update(kwargs)
+            raise TurnstileRequired("https://x/ts", "password_signup")
+
+        rootpy.RootClient.create_account = classmethod(fake)
+        try:
+            factory = AccountFactory(
+                email_pattern="service-{tag}@solluw.com",
+                proxy="socks5://127.0.0.1:1080",
+            )
+            try:
+                await factory.create_return_turnstile(username="bob")
+            except TurnstileRequired:
+                pass
+            return captured
+        finally:
+            rootpy.RootClient.create_account = original
+
+    captured = asyncio.run(run())
+    assert captured.get("proxy") == "socks5://127.0.0.1:1080"
+
+
+def test_create_account_accepts_a_proxy():
+    import inspect
+
+    params = inspect.signature(RootClient.create_account).parameters
+    assert "proxy" in params
+    assert "transport" in params

@@ -1,23 +1,43 @@
+"""Locating the optional media stack.
+
+Voice needs FFmpeg plus the WebRTC stack (``av``, ``aiortc`` and friends).
+These are *not* installed automatically. A library that shells out to ``pip``
+mid-call breaks in every environment where that is not allowed -- frozen
+builds, read-only containers, CI images, managed virtualenvs -- and it does so
+with an error that points at pip rather than at rootpy.
+
+Instead these helpers look for what is already present and, when something is
+missing, raise :class:`MediaDependencyMissing` naming the exact install
+command. Install with ``pip install "rootpy[voice]"``.
+"""
+
 from __future__ import annotations
 
 import importlib
 import os
 from pathlib import Path
 import shutil
-import subprocess
-import sys
 from typing import Optional
 
+from .exceptions import RootError
 
-def _run_pip(*arguments: str) -> None:
-    command = [sys.executable, "-m", "pip", "install", *arguments]
-    completed = subprocess.run(command, check=False)
-    if completed.returncode != 0:
-        raise RuntimeError(
-            "Automatic media dependency installation failed: "
-            + " ".join(command)
+VOICE_EXTRA = 'pip install "rootpy[voice]"'
+
+
+class MediaDependencyMissing(RootError, RuntimeError):
+    """Raised when an optional media dependency is not installed.
+
+    RootError comes first so `except RootError` catches it like everything else
+    the library raises; RuntimeError stays in the MRO for existing handlers.
+    """
+
+    def __init__(self, what: str, hint: str = VOICE_EXTRA) -> None:
+        super().__init__(
+            f"{what} is required for voice support but is not installed. "
+            f"Install the optional media stack with:\n    {hint}"
         )
-    importlib.invalidate_caches()
+        self.what = what
+        self.hint = hint
 
 
 def _can_import(name: str) -> bool:
@@ -28,86 +48,64 @@ def _can_import(name: str) -> bool:
     return True
 
 
-def ensure_ffmpeg() -> str:
-    """Return an FFmpeg executable, installing a private copy when needed."""
+def find_ffmpeg() -> Optional[str]:
+    """Return a usable FFmpeg path, or None. Never installs anything.
+
+    Checked in order: ``$ROOTPY_FFMPEG``, ``ffmpeg`` on PATH, then a copy
+    provided by ``imageio-ffmpeg`` if that happens to be installed.
+    """
     configured = os.environ.get("ROOTPY_FFMPEG")
     if configured and Path(configured).is_file():
         return configured
 
     system_ffmpeg = shutil.which("ffmpeg")
     if system_ffmpeg:
-        os.environ["ROOTPY_FFMPEG"] = system_ffmpeg
         return system_ffmpeg
 
-    if not _can_import("imageio_ffmpeg"):
-        print("rootpy: FFmpeg was not found; installing a private copy...")
-        _run_pip("--only-binary=:all:", "imageio-ffmpeg>=0.5,<1")
+    if _can_import("imageio_ffmpeg"):
+        import imageio_ffmpeg
 
-    import imageio_ffmpeg
+        executable = imageio_ffmpeg.get_ffmpeg_exe()
+        if executable and Path(executable).is_file():
+            return str(Path(executable).resolve())
 
-    executable = imageio_ffmpeg.get_ffmpeg_exe()
-    if not executable or not Path(executable).is_file():
-        raise RuntimeError("imageio-ffmpeg did not provide an FFmpeg executable")
+    return None
 
-    executable = str(Path(executable).resolve())
-    os.environ["ROOTPY_FFMPEG"] = executable
 
-    directory = str(Path(executable).parent)
-    current_path = os.environ.get("PATH", "")
-    if directory not in current_path.split(os.pathsep):
-        os.environ["PATH"] = directory + os.pathsep + current_path
-
+def ensure_ffmpeg() -> str:
+    """Return an FFmpeg path or raise :class:`MediaDependencyMissing`."""
+    executable = find_ffmpeg()
+    if executable is None:
+        raise MediaDependencyMissing(
+            "FFmpeg",
+            hint=(
+                "install FFmpeg from your package manager, set $ROOTPY_FFMPEG "
+                'to its path, or run: pip install "rootpy[voice]"'
+            ),
+        )
+    os.environ.setdefault("ROOTPY_FFMPEG", executable)
     return executable
 
 
-def ensure_media_dependencies() -> Optional[str]:
-    """Install the Python 3.9-compatible media stack when it is absent.
+def missing_media_dependencies() -> list:
+    """Names of the media imports that are absent. Empty means ready to go."""
+    required = ("av", "aiortc")
+    return [name for name in required if not _can_import(name)]
 
-    aiortc 1.13 declares PyAV <15, while the available CPython 3.9 Windows
-    wheel is PyAV 15.1. rootpy therefore installs aiortc without dependency
-    resolution and keeps the binary PyAV wheel already available for 3.9.
+
+def media_stack_available() -> bool:
+    """True when FFmpeg and the WebRTC imports are all present."""
+    return find_ffmpeg() is not None and not missing_media_dependencies()
+
+
+def ensure_media_dependencies() -> str:
+    """Verify the whole media stack is importable; return the FFmpeg path.
+
+    Raises :class:`MediaDependencyMissing` naming the first missing piece.
+    Kept for backwards compatibility -- it no longer installs anything.
     """
-    ffmpeg = ensure_ffmpeg()
-
-    if not _can_import("av"):
-        print("rootpy: installing the PyAV binary wheel...")
-        _run_pip("--only-binary=:all:", "av==15.1.0")
-
-    dependencies = (
-        "aioice>=0.10.1,<1",
-        "cryptography>=44",
-        "google-crc32c>=1.1",
-        "pyee>=13",
-        "pylibsrtp>=0.10",
-        "pyopenssl>=25",
-    )
-    missing = []
-    import_names = (
-        "aioice",
-        "cryptography",
-        "google_crc32c",
-        "pyee",
-        "pylibsrtp",
-        "OpenSSL",
-    )
-    for requirement, import_name in zip(dependencies, import_names):
-        if not _can_import(import_name):
-            missing.append(requirement)
-
+    executable = ensure_ffmpeg()
+    missing = missing_media_dependencies()
     if missing:
-        print("rootpy: installing WebRTC support dependencies...")
-        _run_pip("--only-binary=:all:", *missing)
-
-    if not _can_import("aiortc"):
-        print("rootpy: installing aiortc for Python 3.9...")
-        _run_pip("--no-deps", "aiortc==1.13.0")
-
-    try:
-        importlib.import_module("av")
-        importlib.import_module("aiortc")
-    except ImportError as exc:
-        raise RuntimeError(
-            "The media stack was installed but could not be imported"
-        ) from exc
-
-    return ffmpeg
+        raise MediaDependencyMissing(", ".join(missing))
+    return executable

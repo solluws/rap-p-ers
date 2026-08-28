@@ -4,6 +4,7 @@ Two-account receive test.
 One account (the WATCHER) connects and watches everything; the other (the
 SENDER) posts uniquely-tagged messages into a channel they share. The harness
 then reports, per message, whether the watcher saw it -- and by which path
+
 (gateway push vs. unread sweep) and how long it took.
 
 Everything is written to log.txt.
@@ -32,6 +33,12 @@ import sys
 import time
 import uuid
 from pathlib import Path
+
+# Run from anywhere, installed or not: put the project root on sys.path.
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
 
 from rootpy import RootClient
 

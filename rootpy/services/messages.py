@@ -14,6 +14,7 @@ from ..identifiers import (
     encode_root_guid_parts,
     format_root_guid,
     normalize_root_guid,
+    root_guid_datetime,
 )
 from ..models import Message, MessageSendResult
 from ..protocol import (
@@ -30,6 +31,60 @@ from ..protocol import (
 from ..transport import GrpcWebTransport
 
 log = logging.getLogger("rootpy.messages")
+
+#: How many messages one message may reply to. Root rejects more.
+MAX_REPLY_TARGETS = 5
+
+
+def _oldest_timestamp(messages) -> Optional[float]:
+    """The unix time of the oldest message in a page, from its id.
+
+    Root ids are timestamp GUIDs, so a page's lower boundary is exact and does
+    not have to be estimated. Ids that will not parse are skipped rather than
+    raising -- a single odd row should not stop a history walk.
+    """
+    stamps = []
+    for message in messages:
+        identifier = getattr(message, "id", None)
+        if not identifier:
+            continue
+        try:
+            stamps.append(root_guid_datetime(identifier).timestamp())
+        except Exception:
+            continue
+    return min(stamps) if stamps else None
+
+
+def normalise_reply_targets(targets) -> List[str]:
+    """Ids for the messages being replied to.
+
+    Accepts message ids, :class:`Message` objects, or a mix -- and a single
+    one rather than a list, since replying to one thing is the common case.
+    Duplicates are dropped (Root counts them twice otherwise).
+
+    Raises ``ValueError`` above :data:`MAX_REPLY_TARGETS`, because the server
+    rejects the whole send and the error doesn't say why.
+    """
+    if targets is None:
+        return []
+    if isinstance(targets, (str, bytes)) or hasattr(targets, "id"):
+        targets = [targets]
+
+    ids: List[str] = []
+    for target in targets:
+        raw = getattr(target, "id", target)
+        if not raw:
+            continue
+        normalized = normalize_root_guid(raw)
+        if normalized not in ids:
+            ids.append(normalized)
+
+    if len(ids) > MAX_REPLY_TARGETS:
+        raise ValueError(
+            f"a message can reply to at most {MAX_REPLY_TARGETS} messages; "
+            f"got {len(ids)}"
+        )
+    return ids
 
 MESSAGE_CREATE = (
     "https://api.rootapp.com/root.v2.MessageGrpcService/Create"
@@ -310,6 +365,12 @@ class MessageService:
     # --- history (MessageGrpcService/List) -------------------------------- #
     _DIRECTIONS = {"unspecified": 0, "newer": 1, "older": 2, "both": 3}
 
+    #: MessageList's Limit(15) window, straight from Root's own validator
+    #: message: "Limit: Must be between 10 and 50 [InclusiveBetweenValidator]".
+    #: Laddered live -- 9 and 51 are both refused, 10 and 50 both work.
+    LIMIT_MIN = 10
+    LIMIT_MAX = 50
+
     async def list(
         self,
         container_id: str,
@@ -318,12 +379,14 @@ class MessageService:
         direction: str = "both",
         after: Optional[float] = None,
         limit: Optional[int] = None,
+        include_deleted: bool = False,
     ) -> List[Message]:
         """Fetch message history for a channel or DM.
 
         Mirrors what the official client sends, verified against a live
         capture: ContainerId(10), CommunityId(11), MessageDirectionTake(12)
-        and DateAt(13) -- and no Limit, which the server rejects.
+        and DateAt(13). Limit(15) is optional and omitted by default, which is
+        what the reference client does.
 
         direction:
             ``"both"``  (default) messages around ``after``
@@ -332,11 +395,25 @@ class MessageService:
         after:
             cursor as epoch seconds; defaults to now.
         limit:
-            included only if you ask for it; the reference client never sends
-            it and the server has been seen to reject requests carrying it.
+            omitted unless you ask for it. When given it must be **between 10
+            and 50 inclusive** -- Root applies an InclusiveBetweenValidator and
+            answers INVALID_ARGUMENT otherwise ("Limit: Must be between 10 and
+            50"). Laddered live: 1/2/5/9 refused, 10-50 accepted and returning
+            exactly that many, 51/55/60/75/99/100 refused. Omitting it returns
+            50. Checked here so a bad value costs nothing rather than failing
+            on every page of a walk.
 
         Returns :class:`Message` objects, oldest-first.
         """
+        if limit is not None and not (
+            self.LIMIT_MIN <= int(limit) <= self.LIMIT_MAX
+        ):
+            raise ValueError(
+                f"limit must be between {self.LIMIT_MIN} and {self.LIMIT_MAX} "
+                f"inclusive (got {limit}); Root rejects anything else with "
+                "INVALID_ARGUMENT. Pass limit=None to omit it, which returns "
+                f"{self.LIMIT_MAX}."
+            )
         container_id = normalize_root_guid(container_id)
         community = normalize_root_guid(community_id) if community_id else None
         direction_value = self._DIRECTIONS.get(direction.lower())
@@ -370,7 +447,15 @@ class MessageService:
             headers=self._headers(),
             operation="MessageList",
         )
-        return self._parse_message_list(response.content)
+        messages = self._parse_message_list(response.content)
+        if include_deleted:
+            return messages
+        # Root returns deleted messages as tombstones with DeletedAt(7) set
+        # instead of omitting them, so "list the history" used to include
+        # things the user had already deleted. Filtered by default; pass
+        # include_deleted=True to see the tombstones (they carry
+        # ``deleted_at`` and ``is_deleted``).
+        return type(messages)(m for m in messages if not m.is_deleted)
 
     async def history(
         self,
@@ -392,8 +477,19 @@ class MessageService:
 
         limit: total messages to yield; None means "keep going until the
             server stops returning new ones".
-        page_size: how many to request per round-trip.
+        page_size: how many to request per round-trip. Goes out as
+            MessageList's Limit, so it must be between 10 and 50 inclusive --
+            see :meth:`list`. Checked once here rather than discovered on the
+            first page, because every page would fail the same way.
         """
+        if not (self.LIMIT_MIN <= int(page_size) <= self.LIMIT_MAX):
+            raise ValueError(
+                f"page_size must be between {self.LIMIT_MIN} and "
+                f"{self.LIMIT_MAX} inclusive (got {page_size}); it is sent as "
+                "MessageList's Limit, which Root range-checks. Use limit= to "
+                "cap the total yielded instead."
+            )
+
         seen: set = set()
         cursor = before if before is not None else _time.time()
         produced = 0
@@ -430,11 +526,27 @@ class MessageService:
             if short_page:
                 return
 
-            # Step the cursor past the oldest message of this page. Root's
-            # message ids are time-ordered, but the model carries no timestamp,
-            # so nudge the cursor back by a small amount and rely on the id
-            # de-duplication above to keep the walk correct.
-            cursor = cursor - max(1.0, float(page_size))
+            # Step the cursor to just before this page's oldest message.
+            #
+            # This used to step back by `page_size` *seconds* -- on the theory
+            # that the model carried no timestamp -- which silently truncated
+            # every busy channel. 50 messages spanning more than 50 seconds
+            # put the next cursor back inside the page just read, the server
+            # returned the same rows, `fresh` came back empty, and the walk
+            # stopped believing it had reached the end. Measured on a real
+            # channel: 50 messages walked, 50 more sitting older than the last
+            # one, never fetched.
+            #
+            # Root ids are timestamp GUIDs, so the exact boundary is available
+            # and there is no need to guess an interval.
+            oldest = _oldest_timestamp(batch)
+            if oldest is not None and oldest < cursor:
+                cursor = oldest - 0.001
+            else:
+                # Unparseable ids, or a page that did not move the boundary.
+                # Fall back to a fixed step so the walk still terminates
+                # rather than spinning on the same cursor forever.
+                cursor = cursor - max(1.0, float(page_size))
 
     async def pin_list(
         self,
@@ -489,6 +601,12 @@ class MessageService:
         for n, wt, value in iter_fields(container):
             if n == 11 and wt == 2:
                 f = decode_packet("MESSAGE", bytes(value))
+                # Carry every field the packet actually decodes. This used to
+                # keep only id/container/user/content/community and drop the
+                # rest, so `deleted_at` was always None -- which made
+                # `Message.is_deleted` permanently False and let deleted
+                # messages come back from history looking live. `edited_at`
+                # and `pinned_at` were lost the same way.
                 messages.append(
                     Message(
                         id=f.get("id") or "",
@@ -496,6 +614,10 @@ class MessageService:
                         user_id=f.get("user_id") or "",
                         content=f.get("message_content") or "",
                         community_id=f.get("community_id"),
+                        deleted_at=f.get("deleted_at"),
+                        edited_at=f.get("edited_at"),
+                        pinned_at=f.get("pinned_at"),
+                        payload_raw=f.get("payload"),
                         _service=self,
                     )
                 )
@@ -627,14 +749,17 @@ class MessageService:
         needs_parent_notification: bool = False,
         delete_after: Optional[float] = None,
     ) -> MessageSendResult:
+        """Send a message.
+
+        ``parent_message_ids`` makes it a reply. Root allows replying to up to
+        :data:`MAX_REPLY_TARGETS` messages at once -- pass several ids to
+        reply to several messages with one message.
+        """
         container_id = normalize_root_guid(container_id)
         if community_id is not None:
             community_id = normalize_root_guid(community_id)
 
-        normalized_parents = [
-            normalize_root_guid(item)
-            for item in (parent_message_ids or [])
-        ]
+        normalized_parents = normalise_reply_targets(parent_message_ids)
 
         if not content.rstrip():
             raise ValueError("Message content cannot be empty")

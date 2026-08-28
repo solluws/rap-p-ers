@@ -7,6 +7,7 @@ from typing import Optional
 from .exceptions import (
     AccountAlreadyExists,
     EmailAlreadyExists,
+    GrpcStatus,
     GrpcWebError,
     UsernameAlreadyExists,
 )
@@ -202,6 +203,8 @@ class AuthClient:
         email: str,
         *,
         access_token: Optional[str] = None,
+        turnstile_token: Optional[str] = None,
+        device_id: Optional[str] = None,
     ) -> AuthenticationSession:
         if not username:
             raise ValueError("Username is required")
@@ -210,10 +213,27 @@ class AuthClient:
         if not email:
             raise ValueError("Email is required")
 
-        device_id = create_desktop_device_guid()
+        # The device id MUST be the same across a challenge retry. Root binds
+        # the Turnstile challenge to the request it was issued for, and a new
+        # device id makes the retry look like a brand-new signup -- so the
+        # server mints a fresh challenge and the token you just solved is
+        # never checked. Callers pass the id they used the first time.
+        device_id = device_id or create_desktop_device_guid()
+        # This endpoint is connect.ConnectService/PasswordSignUp -- a DIFFERENT
+        # service from root.UserGrpcService/SignUp, with its own field numbers.
+        # (UserSignUpRequest.cs describes the latter; applying its numbering
+        # here produces INVALID_ARGUMENT, since none of the fields line up.)
+        # PasswordSignUpRequest (connect.ConnectService):
+        #   1 username, 2 password, 3 TURNSTILE token, 4 device description,
+        #   5 device id, 6 email, 7 access token.
+        # 3 and 7 are DIFFERENT fields -- sending the captcha token as 7 means
+        # the server never sees a turnstile token and keeps issuing challenges,
+        # which looks exactly like the token being rejected.
         payload = bytearray()
         payload += string_field(1, username)
         payload += string_field(2, password)
+        if turnstile_token:
+            payload += string_field(3, turnstile_token)
         payload += length_field(4, self._device_description())
         payload += length_field(5, encode_root_guid(device_id))
         payload += string_field(6, email)
@@ -229,7 +249,14 @@ class AuthClient:
             )
         except GrpcWebError as exc:
 
-            if exc.status == "6":
+            # ``exc.status`` is a ``GrpcStatus`` IntEnum, so the string "6" it
+            # used to be compared against never matched and this whole branch
+            # was dead: a taken username or email raised the bare
+            # ``GrpcAlreadyExists`` instead of the typed
+            # ``UsernameAlreadyExists``/``EmailAlreadyExists`` that
+            # ``__init__`` exports and ``AccountCreator`` catches. Compared
+            # against the enum, the way direct_messages.py:199 already does.
+            if exc.status == GrpcStatus.ALREADY_EXISTS:
                 raise self._signup_conflict_from_error(
                     exc,
                     username,

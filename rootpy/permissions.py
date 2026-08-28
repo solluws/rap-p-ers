@@ -4,6 +4,8 @@ from dataclasses import dataclass, fields
 from enum import Enum
 from typing import Optional
 
+from .exceptions import RootError
+
 
 @dataclass(frozen=True)
 class ChannelPermissions:
@@ -30,7 +32,17 @@ class ChannelPermissions:
     channel_app_kick: bool = False
 
     def has(self, name: str) -> bool:
-        return self.channel_full_control or bool(getattr(self, name, False))
+        """True when this permission set grants ``name``.
+
+        ``channel_full_control`` implies every other permission, but only for
+        names that actually exist -- otherwise a typo like ``channel_veiw``
+        silently reported as granted whenever full control was set.
+        """
+        if name not in _FIELD_NAMES:
+            return False
+        if self.channel_full_control:
+            return True
+        return bool(getattr(self, name, False))
 
     def merge(self, other: "ChannelPermissions") -> "ChannelPermissions":
         values = {}
@@ -99,6 +111,11 @@ class CommunityPermission:
         }
         values.update(kwargs)
         return type(self)(**values)
+
+
+#: Valid permission flag names, used by ChannelPermissions.has() to reject
+#: names that are not real permissions.
+_FIELD_NAMES = frozenset(f.name for f in fields(ChannelPermissions))
 
 
 @dataclass(frozen=True)
@@ -193,7 +210,11 @@ class PermissionName(str, Enum):
             return str(value)
 
 
-class CallActionError(RuntimeError):
+class CallActionError(RootError, RuntimeError):
+    # A missing-permission refusal is a routine outcome of user.mute/kick, not a
+    # bug, so it has to be catchable by the library-wide `except RootError` that
+    # docs/errors.md tells applications to use. RuntimeError stays in the MRO so
+    # existing `except RuntimeError` handlers keep working.
     pass
 
 

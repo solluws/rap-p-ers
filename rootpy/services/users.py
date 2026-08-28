@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+from ..validation import validate_username
 from typing import Optional
 
 from collections.abc import Callable
@@ -125,6 +127,10 @@ class UserService:
             raise TypeError("username must be a string")
         if not username:
             raise ValueError("username cannot be empty")
+        # Root's rule, checked before the round trip. Without this a bad
+        # username comes back as a generic INVALID_ARGUMENT that names the
+        # field but not which part of the rule was broken.
+        validate_username(username)
 
         payload = bytearray()
         payload += length_field(1, self._context())
@@ -198,9 +204,10 @@ class UserService:
 
         # remote image -- fetch it, then upload
         if text.startswith(("http://", "https://")):
-            import httpx
-
-            async with httpx.AsyncClient(follow_redirects=True) as http:
+            # Through the transport's proxy, not around it: this is the one
+            # request in the profile-picture path that goes somewhere other
+            # than Root, and it used to be the only one that ignored `proxy=`.
+            async with self.transport.open_plain_client() as http:
                 response = await http.get(text, timeout=30.0)
                 response.raise_for_status()
             filename = text.rsplit("/", 1)[-1].split("?")[0] or "upload.png"

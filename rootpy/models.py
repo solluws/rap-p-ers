@@ -7,6 +7,34 @@ from pathlib import PurePosixPath
 from .permissions import ChannelPermissions, CommunityPermission
 
 
+# --------------------------------------------------------------------------
+# Mentions
+#
+# Root writes mentions into message content as markdown links, not as the
+# Discord-style ``<@id>`` / ``<#id>`` that everyone assumes:
+#
+#     [@someone](root://user/0030bf36-e4a1-8a01-8283-0518094b06e1)
+#     [#general](root://channel/0030bf26-999d-8101-82fd-66b280480024)
+#
+# ``rootpy.commands`` has parsed exactly that shape since it was written --
+# ``USER_MENTION_RE`` and ``CHANNEL_MENTION_RE`` -- but nothing could *build*
+# one. ``Channel.mention`` emitted ``<#id>``, which the library's own parser
+# refuses, and there was no user equivalent at all, so a caller wanting to
+# mention someone had to invent a format. These are the builders that make
+# the two halves agree; the round trip is asserted offline.
+# --------------------------------------------------------------------------
+def build_user_mention(user_id: str, username: Optional[str] = None) -> str:
+    """A mention of ``user_id`` in Root's message syntax."""
+    label = (username or str(user_id)).lstrip("@")
+    return f"[@{label}](root://user/{user_id})"
+
+
+def build_channel_mention(channel_id: str, name: Optional[str] = None) -> str:
+    """A mention of ``channel_id`` in Root's message syntax."""
+    label = (name or str(channel_id)).lstrip("#")
+    return f"[#{label}](root://channel/{channel_id})"
+
+
 @dataclass(frozen=True)
 class AuthenticationSession:
     token: str
@@ -24,6 +52,13 @@ class CallSession:
     video_bandwidth: int = 0
     screen_bandwidth: int = 0
     screen_audio_bandwidth: int = 0
+    # Client 0.9.128 added response fields 17/18/19. When the server routes a
+    # call to the second media backend it answers with the URL and token to use
+    # -- unreachable before, because the response decoder stopped at field 16.
+    # ``backend`` is a WebRtcBackend: 0 unspecified, 1 V1, 2 V2.
+    backend: int = 0
+    server_url: Optional[str] = None
+    access_token: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -105,10 +140,40 @@ class Message:
     async def delete(self) -> None:
         await self._require_service().delete_message(self)
 
-    async def reply(self, content: str, **kwargs) -> "Message":
+    async def reply_with(self, others, content: str, **kwargs) -> "MessageSendResult":
+        """Reply to this message AND others, in one message.
+
+            await first.reply_with([second, third], "answering all three")
+
+        Root allows up to 5 targets in total, this one included.
+
+        Returns a :class:`MessageSendResult`, not a :class:`Message` -- Root's
+        send response carries the new id and container, not a full record.
+        These three send methods were annotated ``-> "Message"``, so a type
+        checker agreed with code like ``(await m.reply("hi")).author`` right up
+        until it raised at runtime.
+        """
+        from .services.messages import normalise_reply_targets
+
+        if not isinstance(others, (list, tuple)):
+            others = [others]
+        targets = normalise_reply_targets([self, *others])
+        return await self._require_service().send(
+            self.container_id,
+            content,
+            community_id=self.community_id,
+            parent_message_ids=targets,
+            **kwargs,
+        )
+
+    async def reply(self, content: str, **kwargs) -> "MessageSendResult":
         """Reply to this message in its own channel.
 
             await message.reply("got it")
+
+        Returns a :class:`MessageSendResult` (id + container), not a
+        :class:`Message`. To reply to several messages at once, see
+        :meth:`reply_with` or ``client.reply_to([...], text)``.
         """
         return await self._require_service().send(
             self.container_id,
@@ -118,8 +183,11 @@ class Message:
             **kwargs,
         )
 
-    async def send_to_channel(self, content: str, **kwargs) -> "Message":
-        """Send a new (non-reply) message to the same channel."""
+    async def send_to_channel(self, content: str, **kwargs) -> "MessageSendResult":
+        """Send a new (non-reply) message to the same channel.
+
+        Returns a :class:`MessageSendResult`, not a :class:`Message`.
+        """
         return await self._require_service().send(
             self.container_id,
             content,
@@ -178,6 +246,16 @@ class Message:
             if attachment.is_audio:
                 return attachment
         return None
+
+    @property
+    def is_deleted(self) -> bool:
+        """True when Root returned this message as a tombstone.
+
+        MessageList includes deleted messages with ``deleted_at`` set rather
+        than dropping them, so anything reading history needs to know the
+        difference between "still there" and "a record that it was removed".
+        """
+        return self.deleted_at is not None
 
     @property
     def first_attachment_url(self) -> Optional[str]:
@@ -362,13 +440,23 @@ class Community:
             **kwargs,
         )
 
+    # These two carried literals rather than the enum, and both were wrong --
+    # the same bug ``CommunityManager`` records fixing at object_api.py:85-95,
+    # left unfixed on the model. ChannelType is
+    # {Unspecified: 0, Text: 1, ThreadedText: 2, Voice: 4, App: 8}, so
+    # ``create_text_channel`` sent Unspecified (which Root rejects) and
+    # ``create_voice_channel`` sent 1 = **Text** -- it succeeded, and silently
+    # made a text channel. Taken from the enum here for the same reason it is
+    # there: a literal cannot drift, but it also cannot be checked.
     async def create_text_channel(
         self,
         channel_group_id: str,
         name: str,
         **kwargs,
     ):
-        kwargs["channel_type"] = 0
+        from .enums import ChannelType
+
+        kwargs["channel_type"] = int(ChannelType.TEXT)
         return await self.create_channel(channel_group_id, name, **kwargs)
 
     async def create_voice_channel(
@@ -377,7 +465,9 @@ class Community:
         name: str,
         **kwargs,
     ):
-        kwargs["channel_type"] = 1
+        from .enums import ChannelType
+
+        kwargs["channel_type"] = int(ChannelType.VOICE)
         return await self.create_channel(channel_group_id, name, **kwargs)
 
     async def create_role(self, name: str, **kwargs):
@@ -428,8 +518,41 @@ class Channel:
 
     @property
     def mention(self) -> str:
-        """The string form that renders as a channel link."""
-        return f"<#{self.id}>"
+        """The string form that renders as a channel link.
+
+        Root's format is a markdown link, not a Discord-style ``<#id>``::
+
+            [#general](root://channel/0030bf26-999d-8101-82fd-66b280480024)
+
+        This returned ``<#{id}>``, which is the shape Discord uses and which
+        ``rootpy.commands.parse_channel_mention`` -- written from real Root
+        message content -- refuses. So the library's own two halves did not
+        agree: ``channel.mention`` produced a string ``parse_channel_mention``
+        could not read back, and Root would have rendered it as literal text
+        rather than a link.
+
+        Falls back to the id when the channel's name is unknown, since the
+        label is part of the syntax.
+        """
+        return build_channel_mention(self.id, self.name)
+
+    async def reply_to(self, messages, content: str, **kwargs):
+        """Reply to several messages in this channel (up to 5).
+
+            await channel.reply_to([msg_a, msg_b], "answering both")
+        """
+        from .services.messages import normalise_reply_targets
+
+        targets = normalise_reply_targets(messages)
+        if not targets:
+            raise ValueError("no messages to reply to")
+        return await self._require_client().messages.send(
+            self.id,
+            content,
+            community_id=self.community_id,
+            parent_message_ids=targets,
+            **kwargs,
+        )
 
     async def send(self, content: str, **kwargs):
         """Send a message to this channel.
@@ -577,6 +700,10 @@ class DetailedMember:
     @property
     def online_status(self) -> int:
         return getattr(self.profile, "online_status", 0)
+
+    @property
+    def is_deleted(self) -> bool:
+        return getattr(self.profile, "is_deleted", False)
 
     # member actions pass straight through
     async def add_role(self, role_id):

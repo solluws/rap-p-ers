@@ -30,6 +30,7 @@ __all__ = [
     "FriendEvent",
     "ChannelEvent",
     "RoleEvent",
+    "ReactionEvent",
     "BlockEvent",
     "CommunityEvent",
     "TypedEventBuilder",
@@ -50,13 +51,23 @@ class RootEvent:
 
 @dataclass(frozen=True)
 class MemberEvent(RootEvent):
-    """A member joined, left, or was banned from a community."""
+    """A member joined, left, was banned from, or came online in a community.
+
+    ``presence`` separates the two families. It is False for the membership
+    events (``member_join``/``member_leave`` from COMMUNITY_JOINED and
+    COMMUNITY_LEAVE) and True for the online/offline events
+    (``member_online``/``member_offline`` from COMMUNITY_MEMBER_ATTACH and
+    COMMUNITY_MEMBER_DETACH), which say nothing about membership -- the app
+    feeds attach straight into SetAttached(userId, true, OnlineStatus)
+    (MemberService.cs:303-315).
+    """
 
     user_id: str = ""
     username: Optional[str] = None
     community_id: str = ""
     community_name: Optional[str] = None
     role_ids: tuple[str, ...] = ()
+    presence: bool = False
 
     def __str__(self) -> str:
         who = self.username or self.user_id
@@ -107,11 +118,22 @@ class ChannelEvent(RootEvent):
     community_name: Optional[str] = None
     channel_group_id: Optional[str] = None
     category: Optional[str] = None       # the channel group's name
-    channel_type: int = 0
+    channel_type: Optional[int] = None
 
     @property
-    def is_text(self) -> bool:
-        return int(self.channel_type or 0) in (1, 2)
+    def is_text(self) -> Optional[bool]:
+        """True/False, or None when nothing here knows the channel's type.
+
+        ChannelType rides on ChannelCreatedPacket only (field 12). The edited
+        packet writes fields 3-6/9-11 and the deleted packet only 3/4/5, so a
+        flat ``channel_type = 0`` made ``if event.is_text:`` drop 100% of edits
+        and deletes. The builder fills the type in from the client's channel
+        cache when the packet omits it; None means genuinely unknown (the
+        channel was never cached), which is not the same answer as False.
+        """
+        if self.channel_type is None:
+            return None
+        return int(self.channel_type) in (1, 2)
 
     def __str__(self) -> str:
         where = self.community_name or self.community_id
@@ -120,7 +142,11 @@ class ChannelEvent(RootEvent):
 
 @dataclass(frozen=True)
 class RoleEvent(RootEvent):
-    """A community role was created, edited, or deleted."""
+    """A community role was created, edited, deleted, or moved.
+
+    Which one is the event name, not a field: create/edit share one oneof slot
+    and are told apart by the packet's own PacketType (see ``SUBROUTES``).
+    """
 
     role_id: str = ""
     name: Optional[str] = None
@@ -128,9 +154,45 @@ class RoleEvent(RootEvent):
     community_name: Optional[str] = None
     color_hex: Optional[str] = None
     mentionable: bool = False
+    # The role this one now sits after, from field 6 of CommunityRoleMovedPacket
+    # (field 9 on CommunityRolePacket). It is the only payload a move carries
+    # beyond the ids, so on_role_move is useless without it. Empty string means
+    # the role moved to the top of the list, which is what the app sends.
+    before_role_id: str = ""
 
     def __str__(self) -> str:
         return self.name or self.role_id
+
+
+@dataclass(frozen=True)
+class ReactionEvent(RootEvent):
+    """Somebody added or removed a reaction on a message.
+
+    One oneof slot (173, ``MessageReactionPacket``) carries four packet types:
+    channel reactions 5801/5802 and direct-message reactions 204/205. The app
+    splits them the same way, in ChannelService.cs:657-666 and
+    DirectMessageService.cs:286-294. Add and remove are the event name;
+    ``is_direct`` tells you which container ``container_id`` names, because a
+    DM reaction carries no community and would otherwise look like a channel
+    reaction in a community you cannot find.
+
+    ``shortcode`` is the emoji as Root stores it. Pass it through
+    :func:`rootpy.normalize_reaction` if you want to compare it to a literal.
+    """
+
+    message_id: str = ""
+    user_id: str = ""
+    username: Optional[str] = None
+    shortcode: str = ""
+    container_id: str = ""
+    channel_name: Optional[str] = None
+    community_id: str = ""
+    community_name: Optional[str] = None
+    is_direct: bool = False
+
+    def __str__(self) -> str:
+        who = self.username or self.user_id
+        return f"{who} {self.shortcode} on {self.message_id}"
 
 
 @dataclass(frozen=True)
@@ -165,10 +227,17 @@ class TypedEventBuilder:
     """
 
     # packet type -> (event name, builder method)
+    #
+    # ATTACH/DETACH are presence, not membership: the app routes an attach into
+    # SetAttached(userId, true, packet.OnlineStatus) (MemberService.cs:303-315)
+    # and CommunityMemberAttachPacket carries a UserOnlineStatus precisely
+    # because it is an online/offline signal. COMMUNITY_JOINED and
+    # COMMUNITY_LEAVE are the real membership packets, so they are the only
+    # things that may fire member_join/member_leave.
     ROUTES = {
-        "COMMUNITY_MEMBER_ATTACH": "member_join",
+        "COMMUNITY_MEMBER_ATTACH": "member_online",
         "COMMUNITY_JOINED": "member_join",
-        "COMMUNITY_MEMBER_DETACH": "member_leave",
+        "COMMUNITY_MEMBER_DETACH": "member_offline",
         "COMMUNITY_LEAVE": "member_leave",
         "COMMUNITY_MEMBER_BAN_CREATED": "member_ban",
         "COMMUNITY_MEMBER_BAN_DELETED": "member_unban",
@@ -181,9 +250,46 @@ class TypedEventBuilder:
         "CHANNEL_DELETED": "channel_delete",
         "COMMUNITY_ROLE": "role_create",
         "COMMUNITY_ROLE_DELETED": "role_delete",
+        "COMMUNITY_ROLE_MOVED": "role_move",
+        "MESSAGE_REACTION": "reaction_add",
         "USER_BLOCK_CREATED": "block_add",
         "USER_BLOCK_DELETED": "block_remove",
     }
+
+    # A oneof slot is not always one event. Slot 90 (COMMUNITY_ROLE) carries
+    # CommunityRolePacket for both create (5401) and edit (5402), and the app
+    # discriminates on the packet's own PacketType before deciding what to do
+    # with it (RoleService.cs:74-92). Routing on the slot alone meant a rename,
+    # a recolour or an is_mentionable toggle all arrived as on_role_create with
+    # a RoleEvent indistinguishable from a genuine creation.
+    #
+    # 5403/5404 have their own slots (91/92) and so never reach here, but they
+    # are listed because they are legal values of the same field.
+    #
+    # Slot 173 (MESSAGE_REACTION) is the same story and worse: one
+    # MessageReactionPacket serves add and remove, for channels *and* for DMs.
+    # ChannelService.cs:657-666 splits 5801/5802 and DirectMessageService.cs
+    # :286-294 splits 204/205, all four casting the same packet class. Without
+    # the subroute a removed reaction is indistinguishable from a new one.
+    SUBROUTES = {
+        "COMMUNITY_ROLE": {
+            5401: "role_create",
+            5402: "role_edit",
+            5403: "role_delete",
+            5404: "role_move",
+        },
+        "MESSAGE_REACTION": {
+            204: "reaction_add",       # direct message
+            205: "reaction_remove",    # direct message
+            5801: "reaction_add",      # channel
+            5802: "reaction_remove",   # channel
+        },
+    }
+
+    # The direct-message half of the subroute above. Kept beside it so the two
+    # cannot drift apart: these are the packet types whose container_id names a
+    # DM rather than a channel.
+    _DM_REACTIONS = (204, 205)
 
     def __init__(self, client) -> None:
         self.client = client
@@ -213,6 +319,11 @@ class TypedEventBuilder:
                 return getattr(role, "name", None)
         return None
 
+    def _cached_channel(self, channel_id):
+        if not channel_id:
+            return None
+        return getattr(self.client, "channels", {}).get(channel_id)
+
     def _username(self, user_id) -> Optional[str]:
         """Username from cache if we've seen this user; never fetches."""
         if not user_id:
@@ -229,10 +340,22 @@ class TypedEventBuilder:
         if name is None:
             return None
         fields = packet.fields or {}
+        subroute = self.SUBROUTES.get(packet.type.name)
+        if subroute:
+            # packet_type is field 1 on every packet message. A schema that
+            # does not decode it yields None -- keep the slot's default route
+            # rather than guessing.
+            packet_type = fields.get("packet_type")
+            if packet_type is not None:
+                try:
+                    name = subroute.get(int(packet_type), name)
+                except (TypeError, ValueError):
+                    pass
         builder = getattr(self, f"_build_{name}", None)
         if builder is None:
             # Group families that share a shape.
-            if name in ("member_join", "member_leave", "member_ban", "member_unban"):
+            if name in ("member_join", "member_leave", "member_ban",
+                        "member_unban", "member_online", "member_offline"):
                 builder = self._build_member
             elif name in ("role_add", "role_remove"):
                 builder = self._build_member_role
@@ -240,8 +363,10 @@ class TypedEventBuilder:
                 builder = self._build_friend
             elif name in ("channel_create", "channel_edit", "channel_delete"):
                 builder = self._build_channel
-            elif name in ("role_create", "role_delete"):
+            elif name in ("role_create", "role_edit", "role_delete", "role_move"):
                 builder = self._build_role
+            elif name in ("reaction_add", "reaction_remove"):
+                builder = self._build_reaction
             elif name in ("block_add", "block_remove"):
                 builder = self._build_block
             else:
@@ -260,6 +385,9 @@ class TypedEventBuilder:
             community_id=community_id,
             community_name=self._community_name(community_id),
             role_ids=tuple(r for r in roles if r),
+            presence=packet.type.name in (
+                "COMMUNITY_MEMBER_ATTACH", "COMMUNITY_MEMBER_DETACH",
+            ),
             raw=packet,
         )
 
@@ -291,26 +419,72 @@ class TypedEventBuilder:
     def _build_channel(self, fields, packet) -> ChannelEvent:
         community_id = fields.get("community_id") or ""
         group_id = fields.get("channel_group_id")
+        channel_id = fields.get("id") or ""
+        name = fields.get("name")
+        channel_type = fields.get("channel_type")
+        # Only ChannelCreatedPacket carries ChannelType (field 12), and the
+        # deleted packet carries no name either, so fall back to whatever the
+        # client already cached for this channel. The gateway dispatches
+        # "packet" before "channel_deleted" evicts it, so the cache is still
+        # warm even on a delete. Anything still missing stays None (unknown).
+        if channel_type is None or name is None:
+            cached = self._cached_channel(channel_id)
+            if cached is not None:
+                if channel_type is None:
+                    channel_type = getattr(cached, "channel_type", None)
+                if name is None:
+                    name = getattr(cached, "name", None)
         return ChannelEvent(
-            channel_id=fields.get("id") or "",
-            name=fields.get("name"),
+            channel_id=channel_id,
+            name=name,
             community_id=community_id,
             community_name=self._community_name(community_id),
             channel_group_id=group_id,
             category=self._channel_group_name(community_id, group_id),
-            channel_type=int(fields.get("channel_type") or 0),
+            channel_type=None if channel_type is None else int(channel_type),
             raw=packet,
         )
 
     def _build_role(self, fields, packet) -> RoleEvent:
         community_id = fields.get("community_id") or ""
+        # Field 4 is the role id on all three slots, but the schemas name it
+        # differently: CommunityRolePacket and CommunityRoleMovedPacket call it
+        # ``id``, CommunityRoleDeletedPacket calls it ``community_role_id``.
+        # Reading only ``id`` gave every on_role_delete an empty role_id.
+        role_id = fields.get("id") or fields.get("community_role_id") or ""
         return RoleEvent(
-            role_id=fields.get("id") or "",
-            name=fields.get("name"),
+            role_id=role_id,
+            name=fields.get("name") or self._role_name(community_id, role_id),
             community_id=community_id,
             community_name=self._community_name(community_id),
             color_hex=fields.get("color_hex"),
             mentionable=bool(fields.get("is_mentionable")),
+            before_role_id=fields.get("before_community_role_id") or "",
+            raw=packet,
+        )
+
+    def _build_reaction(self, fields, packet) -> ReactionEvent:
+        community_id = fields.get("community_id") or ""
+        container_id = fields.get("container_id") or ""
+        user_id = fields.get("user_id") or ""
+        packet_type = fields.get("packet_type")
+        try:
+            is_direct = int(packet_type) in self._DM_REACTIONS
+        except (TypeError, ValueError):
+            # No decoded packet_type. A DM reaction carries no community, so
+            # the absent community id is the only other signal available.
+            is_direct = not community_id
+        channel = None if is_direct else self._cached_channel(container_id)
+        return ReactionEvent(
+            message_id=fields.get("message_id") or "",
+            user_id=user_id,
+            username=self._username(user_id),
+            shortcode=fields.get("shortcode") or "",
+            container_id=container_id,
+            channel_name=getattr(channel, "name", None),
+            community_id=community_id,
+            community_name=self._community_name(community_id),
+            is_direct=is_direct,
             raw=packet,
         )
 

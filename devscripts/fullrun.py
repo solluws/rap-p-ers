@@ -4,6 +4,7 @@ Full end-to-end exercise of the SDK against a real server, with timings.
 PHASE 0 times every way to log in (token-only, minimal, lazy, eager, gateway)
 so you can see what each mode actually costs. Note the FIRST mode measured
 pays cold DNS and a full TLS handshake, so it reads slower than it is --
+
 benchmark.py alternates the order if you want a fair comparison. PHASE 1 runs the full lifecycle,
 timing every step and measuring real delivery latency (send -> readable).
 
@@ -67,9 +68,15 @@ import traceback
 import uuid
 from pathlib import Path
 
+# Run from anywhere, installed or not: put the project root on sys.path.
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+
 from rootpy import RootClient
 
-INVITE_CODE = "ADCzQLkdjwq8Xq6L70KWTw"
+INVITE_CODE = "ADCuyZscjQq121ZbcLRiaA"
 
 # Username to send a test friend request to (step 15b).
 FRIEND_TARGET = "systemctl"
@@ -161,7 +168,7 @@ class Results:
 
 
 def load_token() -> str:
-    token = os.environ.get("ROOT_TOKEN", "ADCnx87GigGlIjii_1iz5gAwp8fQwoUSrvtegqxYvkC5WkUOcOcCQamitgctR1gwuGijUc9U2k7BkyWdzPSbQQ-g6q7EMzKxQBnv65vzatRjYC5eyNxJcOVMntEYwgWGm3hbsvLz6pQR9b6ab8idMSeMlXJbnLG0aS6nLG50O80")
+    token = os.environ.get("ROOT_TOKEN", "")
     path = Path(__file__).with_name("tokens.txt")
     if not token and path.exists():
         for line in path.read_text(encoding="utf-8").splitlines():

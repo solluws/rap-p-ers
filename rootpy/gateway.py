@@ -33,6 +33,7 @@ from .events import (
     ChannelAction,
     NotificationEvent,
 )
+from .enums import PacketErrorCode
 from .models import Channel, Community, Message, MessageAttachment
 from .packets import PacketType, SocketPacket
 from .packet_schemas import decode_packet
@@ -70,6 +71,8 @@ class Gateway:
         reconnect_base: float = 1.0,
         reconnect_max: float = 30.0,
         max_reconnect_attempts: Optional[int] = None,
+        contention_pause: float = 0.0,
+        contention_threshold: int = 3,
     ) -> None:
         self.hub_url = hub_url
         self.token = token
@@ -79,6 +82,20 @@ class Gateway:
         self.reconnect_base = max(0.0, float(reconnect_base))
         self.reconnect_max = max(self.reconnect_base, float(reconnect_max))
         self.max_reconnect_attempts = max_reconnect_attempts
+        # A run of 4016 closes usually means a *second* client is live on this
+        # account: both sides advance the hub's sequence cursor, so whichever
+        # one resumes second is always out of range. Reconnecting harder makes
+        # that worse -- each attempt is another cursor fight -- and the normal
+        # backoff caps out at reconnect_max, so it settles into a permanent
+        # once-a-minute retry that never recovers on its own.
+        #
+        # Standing off for a few minutes lets the other client finish. Off by
+        # default (0.0) because it is a policy an application picks, not
+        # something a library should impose on a caller that would rather see
+        # the errors.
+        self.contention_pause = max(0.0, float(contention_pause))
+        self.contention_threshold = max(1, int(contention_threshold))
+        self._contention_streak = 0
         self.current_sequence: Optional[int] = None
         self.last_non_ping_sequence: Optional[int] = None
         self._task: Optional[asyncio.Task] = None
@@ -109,6 +126,28 @@ class Gateway:
         # Optional StateCache -- set by the client so decoded
         # notifications can teach it usernames. None is fine.
         self.client_cache = None
+        # Optional SOCKS/HTTP proxy for the websocket, matching the
+        # transport's. None means a direct connection.
+        self.proxy = None
+        # Build the two exploratory protobuf-to-JSON trees that
+        # ``_socket_response`` puts on ``data["notification"]`` and
+        # ``data["packet_container"]``. Off by default because they are a
+        # debugging aid that nothing reads: no library code, test, devscript
+        # or example in this repo touches either key, and the decoded
+        # ``fields`` (plus ``raw_hex``/``packet_raw_hex``) carry the same
+        # information in the form callers actually use.
+        #
+        # They are not cheap. ``_bytes_to_json`` speculatively hexes and
+        # UTF-8-decodes every length-delimited field and recurses six levels
+        # deep, and ``packet_container``'s tree is a strict *subtree* of
+        # ``notification``'s, recomputed from scratch. Measured on a 556-byte
+        # MessageCreate frame: 107.7 us of the 169.1 us this function costs --
+        # 64% -- and it was paid on **every** frame, keepalive pings included,
+        # on the event loop.
+        #
+        # Set True when you are reverse-engineering an unfamiliar packet:
+        #     client.gateway.decode_debug_trees = True
+        self.decode_debug_trees = False
 
     async def start(self) -> None:
         if self._task is None:
@@ -145,6 +184,25 @@ class Gateway:
     async def wait_closed(self) -> None:
         await self._closed.wait()
 
+    #: Close codes that mean "your resume cursor is not valid", which is what
+    #: a second client on the same account looks like from here.
+    CONTENTION_CLOSE_CODES = (4016,)
+
+    def _is_contention(self, exc: BaseException) -> bool:
+        """Was this drop a sequence-cursor fight rather than a network fault?
+
+        Prefers the close code the server actually sent. Falls back to the
+        exception text because ``websockets`` only populates ``close_code`` on
+        the connection object once the closing handshake completes, and a
+        half-closed socket can raise with it still unset -- in which case the
+        code is still in the message ("received 4016 (private use) Sequence out
+        of range").
+        """
+        if self._last_close_code in self.CONTENTION_CLOSE_CODES:
+            return True
+        text = str(exc)
+        return any(str(code) in text for code in self.CONTENTION_CLOSE_CODES)
+
     def _backoff_delay(self, attempt: int) -> float:
         """Exponential backoff with full jitter, capped at reconnect_max."""
         ceiling = min(
@@ -175,6 +233,10 @@ class Gateway:
                         exc,
                     )
                     healthy = False
+                    if self._is_contention(exc):
+                        self._contention_streak += 1
+                    else:
+                        self._contention_streak = 0
                 else:
                     # Clean end of the message stream. This hub is a resync-on-
                     # connect design: it delivers a batch of packets and then
@@ -184,11 +246,48 @@ class Gateway:
                     # one means we're caught up (or failing), so we back off.
                     self._connect_error = None
                     healthy = self._got_data
+                    # Any clean end of stream -- with data or without -- proves
+                    # the cursor was accepted, so it is not contention. Only
+                    # resetting on `healthy` treated an ordinary caught-up
+                    # cycle as if it were another failure, and a flaky link
+                    # could accumulate its way to a pause it had not earned.
+                    self._contention_streak = 0
 
                 if self._stopping or not self.auto_reconnect:
                     break
 
                 self._ready.clear()
+
+                # Stand off rather than keep fighting for the cursor. The
+                # threshold matters: a single 4016 is ordinary -- the cursor
+                # went stale over a quiet period, _run_once has already dropped
+                # it, and the next attempt succeeds. Only a *run* of them means
+                # something else is advancing the cursor as fast as we reset it.
+                if (
+                    self.contention_pause > 0
+                    and self._contention_streak >= self.contention_threshold
+                ):
+                    log.warning(
+                        "gateway sequence contention (%d closes in a row); "
+                        "pausing %.0fs -- this usually means another client is "
+                        "live on this account",
+                        self._contention_streak,
+                        self.contention_pause,
+                    )
+                    self._contention_streak = 0
+                    attempt = 0
+                    await self.dispatch("gateway_paused", self.contention_pause)
+                    try:
+                        await asyncio.sleep(self.contention_pause)
+                    except asyncio.CancelledError:
+                        raise
+                    log.info("gateway resuming after contention pause")
+                    await self.dispatch("gateway_resumed", None)
+                    # Resume clean: whatever cursor we held is certainly stale
+                    # after five minutes of someone else using the account.
+                    self.current_sequence = None
+                    self.last_non_ping_sequence = None
+                    continue
 
                 if healthy:
                     # Normal resync cycle -- reconnect right away, quietly, and
@@ -335,6 +434,8 @@ class Gateway:
         sequence: Optional[int],
         packet_case: Optional[int],
         packet_container: Optional[bytes],
+        debug_trees: bool = False,
+        error_code: Optional[int] = None,
     ) -> dict[str, Any]:
         packet_payload = None
 
@@ -353,11 +454,16 @@ class Gateway:
         return {
             "sequence": sequence,
             "packet_case": packet_case,
+            "error_code": error_code,
             "raw_hex": message.hex(),
-            "notification": cls._protobuf_fields_to_json(message),
+            # Both keys always exist; they carry their tree only when asked
+            # for. See ``decode_debug_trees`` in __init__ for the measurement.
+            "notification": (
+                cls._protobuf_fields_to_json(message) if debug_trees else None
+            ),
             "packet_container": (
                 cls._protobuf_fields_to_json(packet_container)
-                if packet_container is not None
+                if debug_trees and packet_container is not None
                 else None
             ),
             "packet": (
@@ -378,12 +484,24 @@ class Gateway:
         }
 
     @staticmethod
-    def _notification_info(message: bytes) -> tuple[Optional[int], Optional[int], Optional[bytes]]:
+    def _notification_info(
+        message: bytes,
+    ) -> tuple[Optional[int], Optional[int], Optional[bytes], Optional[int]]:
+        """Split a ``ClientNotification`` into its three wire fields.
+
+        The error code is returned last so the long-standing three-value
+        unpack keeps working; it is ``None`` on the overwhelming majority of
+        frames, because the server only writes field 1 when it is non-zero
+        (``InternalWriteTo`` skips ``PACKET_ERROR_CODE_UNSPECIFIED``).
+        """
         sequence = None
         packet_case = None
         packet_container = None
+        error_code = None
         for n, wt, value in iter_fields(message):
-            if n == 2 and wt == 0:
+            if n == 1 and wt == 0:
+                error_code = PacketErrorCode.coerce(int(value))
+            elif n == 2 and wt == 0:
                 sequence = int(value)
             elif n == 3 and wt == 2:
                 packet_container = value
@@ -391,7 +509,7 @@ class Gateway:
             for n, _, _ in iter_fields(packet_container):
                 packet_case = n
                 break
-        return sequence, packet_case, packet_container
+        return sequence, packet_case, packet_container, error_code
 
     @staticmethod
     def _detach_container(packet_container: Optional[bytes]) -> Optional[str]:
@@ -1005,6 +1123,7 @@ class Gateway:
         import inspect
 
         connect = _import_websockets().connect
+        proxy_url = getattr(self, "proxy", None)
         try:
             params = set(inspect.signature(connect).parameters)
             has_var_kw = any(
@@ -1033,6 +1152,20 @@ class Gateway:
         ):
             if supported(name):
                 kwargs[name] = value
+
+        # Route the websocket through the same proxy as the API, when one is
+        # set. websockets >= 13 takes `proxy=`; older versions need
+        # python-socks and a custom sock, so we degrade rather than fail.
+        if proxy_url:
+            if supported("proxy"):
+                kwargs["proxy"] = proxy_url
+            else:
+                log.warning(
+                    "websockets %s can't proxy directly; the gateway will "
+                    "connect straight out. Upgrade websockets (>=13) to route "
+                    "it through %s",
+                    getattr(_import_websockets(), "__version__", "?"), proxy_url,
+                )
 
         # If introspection couldn't tell us the header name, try both spellings.
         if "additional_headers" not in kwargs and "extra_headers" not in kwargs:
@@ -1073,7 +1206,24 @@ class Gateway:
                     async for message in websocket:
                         if not isinstance(message, bytes):
                             continue
-                        sequence, packet_case, packet_container = self._notification_info(message)
+                        (
+                            sequence,
+                            packet_case,
+                            packet_container,
+                            error_code,
+                        ) = self._notification_info(message)
+                        if error_code == PacketErrorCode.SYNC_LOST:
+                            # The server telling us our cursor is stale, in
+                            # band. Everything downstream still runs -- a
+                            # SYNC_LOST frame can carry a packet -- this is an
+                            # extra signal beside the 4016 close-code path,
+                            # not a replacement for it.
+                            log.warning(
+                                "gateway sync lost at seq=%s; the server "
+                                "rejected our resume cursor",
+                                sequence,
+                            )
+                            await self.dispatch("sync_lost", sequence)
                         if sequence is not None:
                             self._got_data = True
                             log.debug(
@@ -1087,6 +1237,8 @@ class Gateway:
                             sequence,
                             packet_case,
                             packet_container,
+                            debug_trees=self.decode_debug_trees,
+                            error_code=error_code,
                         )
                         socket_packet = SocketPacket(
                             sequence=sequence,

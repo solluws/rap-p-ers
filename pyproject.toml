@@ -4,9 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rootpy-client"
-version = "0.3.0"
+version = "1.29.0"
 description = "Async Python client for the Root chat platform"
 readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "solluws" }]
 requires-python = ">=3.10"
 dependencies = [
     "httpx[http2]>=0.27",
@@ -15,9 +17,39 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+# Voice / WebRTC. Never installed automatically -- rootpy raises
+# MediaDependencyMissing naming this extra instead of shelling out to pip.
+voice = [
+    "av>=15.1",
+    "aiortc>=1.13",
+    "imageio-ffmpeg>=0.5,<1",
+    "playwright>=1.44",
+]
 
 [tool.setuptools.packages.find]
 include = ["rootpy*"]
+# examples/ lives at the repo root; it is documentation, not shipped code.
+exclude = ["rootpy.examples*", "tests*", "devscripts*"]
+
+[tool.setuptools.package-data]
+# The generated protocol registries. Without this the wheel installs but
+# every schema lookup raises at runtime.
+rootpy = ["data/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "auto"
+# The live fixtures (client, sandbox) are session-scoped and hold an httpx
+# AsyncClient plus a websocket. With the default function-scoped loop those
+# objects outlive the loop they were created on: the first test closes it and
+# every later test fails with "'NoneType' object has no attribute 'send'",
+# "Event loop is closed", or a spurious 401. Fixtures and tests must share one
+# loop for the whole session.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+# Live tests are opt-in: they need ROOT_TOKEN and create a real community.
+addopts = "-m 'not live and not live2'"
+markers = [
+    "live: talks to a real Root account; needs ROOT_TOKEN. Run with: pytest -m live",
+    "live2: needs a second account (ROOT_TOKEN and ROOT_TOKEN2) to test sending and receiving. Run with: pytest -m live2",
+]

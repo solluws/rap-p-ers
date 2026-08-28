@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import statistics
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 
 @dataclass
@@ -34,13 +34,26 @@ class EndpointStats:
     errors: int = 0
     retries: int = 0
     rate_limited: int = 0
+    #: A *bounded* sample, kept only for the median. Never sum this -- see
+    #: ``roundtrip_total``.
     roundtrip_ms: List[float] = field(default_factory=list)
+    #: Exact running totals, unaffected by the sample's truncation. Anything
+    #: that must stay correct past 1000 calls to one endpoint reads these.
+    roundtrip_total: float = 0.0
+    roundtrip_low: Optional[float] = None
+    roundtrip_high: Optional[float] = None
     wait_ms: float = 0.0
     overhead_ms: float = 0.0
 
     def record(self, roundtrip: float, wait: float, overhead: float) -> None:
         self.calls += 1
         self.roundtrip_ms.append(roundtrip)
+        # Accumulate exactly, *before* any truncation can drop the value.
+        self.roundtrip_total += roundtrip
+        if self.roundtrip_low is None or roundtrip < self.roundtrip_low:
+            self.roundtrip_low = roundtrip
+        if self.roundtrip_high is None or roundtrip > self.roundtrip_high:
+            self.roundtrip_high = roundtrip
         self.wait_ms += wait
         self.overhead_ms += overhead
         # Keep the sample bounded -- we only need the distribution.
@@ -49,19 +62,32 @@ class EndpointStats:
 
     @property
     def total_roundtrip_ms(self) -> float:
-        return sum(self.roundtrip_ms)
+        """Every call's round trip, exactly.
+
+        This used to be ``sum(self.roundtrip_ms)``, which silently summed the
+        *bounded sample* rather than the calls. Past 1000 calls to one endpoint
+        the truncation above starts discarding values, so the "total" converged
+        toward ``1000 * mean`` no matter how many requests were actually made
+        -- understating without bound. Because ``report()`` ranks endpoints by
+        this number and ``summary()`` divides by it, a busy endpoint could be
+        reported as *both* slower on average and lower-total than a quiet one
+        it dominated.
+        """
+        return self.roundtrip_total
 
     def summary(self) -> dict:
+        # Median is the one figure the bounded sample is genuinely for; total,
+        # min and max come from the exact accumulators.
         samples = self.roundtrip_ms or [0.0]
         return {
             "calls": self.calls,
             "errors": self.errors,
             "retries": self.retries,
             "rate_limited": self.rate_limited,
-            "roundtrip_total_ms": round(sum(samples), 1),
+            "roundtrip_total_ms": round(self.roundtrip_total, 1),
             "roundtrip_median_ms": round(statistics.median(samples), 1),
-            "roundtrip_min_ms": round(min(samples), 1),
-            "roundtrip_max_ms": round(max(samples), 1),
+            "roundtrip_min_ms": round(self.roundtrip_low or 0.0, 1),
+            "roundtrip_max_ms": round(self.roundtrip_high or 0.0, 1),
             "wait_ms": round(self.wait_ms, 1),
             "overhead_ms": round(self.overhead_ms, 1),
         }
@@ -139,6 +165,18 @@ class TransportStats:
         """A readable table -- print this when something feels slow."""
         totals = self.totals()
         if not totals["calls"]:
+            # A client that was only ever throttled has real activity to
+            # report even though no request completed. Saying "no requests
+            # recorded" there hides exactly the situation you opened the
+            # report to investigate.
+            noted = totals["rate_limited"] + totals["errors"] + totals["retries"]
+            if noted:
+                return (
+                    "no completed requests: "
+                    f"{totals['rate_limited']} rate-limited, "
+                    f"{totals['errors']} error(s), "
+                    f"{totals['retries']} retry(ies)"
+                )
             return "no requests recorded"
 
         lines = [

@@ -44,6 +44,21 @@ LEAVE = (
     "root.CommunityGrpcService/Leave"
 )
 
+ATTACH = (
+    "https://api.rootapp.com/"
+    "root.CommunityGrpcService/Attach"
+)
+
+DETACH = (
+    "https://api.rootapp.com/"
+    "root.CommunityGrpcService/Detach"
+)
+
+DETACH_MANY = (
+    "https://api.rootapp.com/"
+    "root.CommunityGrpcService/DetachMany"
+)
+
 
 def _decode_wrapped_string(data: bytes) -> Optional[str]:
     for number, wire_type, value in iter_fields(data):
@@ -408,6 +423,68 @@ class CommunityService:
             body=grpc_frame(bytes(payload)),
             headers=self._headers(),
             operation="CommunityLeave",
+        )
+
+    async def attach(self, community_id: str) -> None:
+        """Subscribe this account's hub connections to a community.
+
+        Membership alone delivers nothing. Until a community is attached the
+        hub sends no packet for it -- not a message, not a channel edit --
+        while user-scoped traffic (DMs, notifications, status) arrives
+        normally. That asymmetry is why a bot can look perfectly connected and
+        still never see a channel post.
+
+        The desktop client does this from its full-load path
+        (``Community.attachAsync`` runs off
+        ``UpdateFromCommunityExtendedResponse``) and undoes it in
+        ``FullyUnload``, which is why it only receives live traffic for
+        communities it has actually opened.
+
+        Attaching is **visible to other members**: the server broadcasts
+        ``COMMUNITY_MEMBER_ATTACH`` (5502), and clients show attached members
+        as present. Use :meth:`detach` to go back.
+
+        The subscription is per hub connection, so it has to be re-established
+        after a reconnect -- :class:`~rootpy.unread.UnreadReader` does that for
+        you.
+        """
+        community_id = normalize_root_guid(community_id)
+        await self.transport.unary(
+            endpoint=ATTACH,
+            body=grpc_frame(length_field(10, encode_root_guid(community_id))),
+            headers=self._headers(),
+            operation="CommunityAttach",
+        )
+
+    async def detach(self, community_id: str) -> None:
+        """Stop receiving a community's packets, and stop appearing present."""
+        community_id = normalize_root_guid(community_id)
+        await self.transport.unary(
+            endpoint=DETACH,
+            body=grpc_frame(length_field(10, encode_root_guid(community_id))),
+            headers=self._headers(),
+            operation="CommunityDetach",
+        )
+
+    async def detach_many(self, community_ids) -> None:
+        """Detach from several communities in one request.
+
+        ``CommunityDetachManyRequest`` repeats field 10, so this is one round
+        trip instead of one per community. An empty sequence sends nothing.
+        """
+        payload = bytearray()
+        for community_id in community_ids:
+            payload += length_field(
+                10,
+                encode_root_guid(normalize_root_guid(community_id)),
+            )
+        if not payload:
+            return
+        await self.transport.unary(
+            endpoint=DETACH_MANY,
+            body=grpc_frame(bytes(payload)),
+            headers=self._headers(),
+            operation="CommunityDetachMany",
         )
 
     async def list_mine(self) -> tuple[Community, ...]:

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from ..enums import ChannelType
 from ..identifiers import (
     create_command_idempotency_guid,
     encode_root_guid,
@@ -138,6 +139,16 @@ def _decode_overlay(data: bytes) -> ChannelOverlay:
     return ChannelOverlay(**values)
 
 
+# The colour rules live in rootpy.validation with the username/nickname
+# rules, so there is one place to look when Root rejects a formatted value.
+# Re-exported here because these names were public from this module first.
+from ..validation import (  # noqa: F401
+    DEFAULT_PICTURE_HEX,
+    PICTURE_HEX_LENGTH,
+    normalize_hex_colour,
+)
+
+
 class CommunityAdminService:
     def __init__(
         self,
@@ -205,7 +216,7 @@ class CommunityAdminService:
         self,
         name: str,
         *,
-        picture_hex: str = "",
+        picture_hex: str = DEFAULT_PICTURE_HEX,
         icon_upload_token_uri: Optional[str] = None,
         description: Optional[str] = None,
         reject_unverified_email: bool = False,
@@ -215,8 +226,13 @@ class CommunityAdminService:
         payload = bytearray()
         payload += length_field(1, self._context())
         payload += length_field(10, name.encode("utf-8"))
-        if picture_hex:
-            payload += length_field(11, picture_hex.encode("utf-8"))
+        # Always sent. Root's NotEmptyValidator rejects the request when
+        # field 11 is absent, and this used to be wrapped in a truthiness
+        # guard that skipped it whenever the (empty) default was used -- so
+        # create_community could never succeed without an explicit colour.
+        payload += length_field(
+            11, normalize_hex_colour(picture_hex).encode("utf-8")
+        )
         if template_type:
             payload += length_field(12, template_type.encode("utf-8"))
         if icon_upload_token_uri is not None:
@@ -261,10 +277,29 @@ class CommunityAdminService:
         payload += length_field(1, self._context())
         payload += length_field(10, encode_root_guid(community_id))
 
-        if name is not None:
-            payload += length_field(11, name.encode("utf-8"))
-        if picture_hex is not None:
-            payload += length_field(12, picture_hex.encode("utf-8"))
+        # CommunityEdit is a *replace*, not a patch. Root validates Name and
+        # PictureHex as required, so omitting either fails even when you only
+        # meant to change the description -- and fixing them one at a time is
+        # whack-a-mole, because the next required field behaves the same way.
+        # Instead: if anything with replace semantics is missing, read the
+        # community once and carry every such value forward. Supplying all of
+        # them explicitly skips the read entirely.
+        REPLACED = ("name", "picture_hex")
+        supplied = {"name": name, "picture_hex": picture_hex}
+        if any(supplied[f] is None for f in REPLACED):
+            current = (
+                await self.community_service.get_extended(community_id)
+            ).community
+            for attribute in REPLACED:
+                if supplied[attribute] is None:
+                    supplied[attribute] = getattr(current, attribute, None)
+            name = supplied["name"]
+            picture_hex = supplied["picture_hex"]
+
+        payload += length_field(11, (name or "").encode("utf-8"))
+        payload += length_field(
+            12, normalize_hex_colour(picture_hex or DEFAULT_PICTURE_HEX).encode("utf-8")
+        )
         if update_picture:
             payload += bool_field(13, True)
         if picture_token_uri is not None:
@@ -424,7 +459,12 @@ class CommunityAdminService:
         name: str,
         *,
         description: Optional[str] = None,
-        channel_type: int = 0,
+        # Defaults to TEXT, not 0. ChannelType 0 is Unspecified, which Root
+        # rejects with a PredicateValidator (see object_api.py:82-92), so the
+        # old default meant the three-argument call -- the obvious one, and
+        # the one both README.md and docs/api.md show -- could not succeed
+        # against any server. TEXT is what every caller in the repo passes.
+        channel_type: int = int(ChannelType.TEXT),
         use_channel_group_permission: bool = False,
         icon_token_uri: Optional[str] = None,
         access_rules: Optional[Iterable[AccessRule]] = None,
@@ -583,7 +623,16 @@ class CommunityAdminService:
         payload += length_field(11, name.encode("utf-8"))
 
         if color_hex is not None:
-            payload += length_field(12, _string_wrapper(color_hex))
+            # Same "#rrggbb" form as PictureHex -- proven against the live API
+            # by create_role. Normalising here means callers can pass
+            # "3498db" or "#3498DB" and neither costs a round trip to learn
+            # that Root wanted exactly seven characters.
+            payload += length_field(
+                12,
+                _string_wrapper(
+                    normalize_hex_colour(color_hex, field_name="color_hex")
+                ),
+            )
         if community_permissions is not None:
             payload += length_field(
                 15,
@@ -626,14 +675,80 @@ class CommunityAdminService:
         role_id: str,
         *,
         name: str,
-        color_hex: str = "",
+        color_hex: Optional[str] = None,
         community_permissions: Optional[CommunityPermission] = None,
         channel_permissions: Optional[ChannelPermissions] = None,
         mentionable: bool = False,
         self_assignable: bool = False,
     ) -> CommunityRole:
+        """Edit a role.
+
+        ``CommunityRoleEdit`` is a replace, like ``CommunityEdit``: it carries
+        Name, ColorHex and both permission sets, so an empty ColorHex blanked
+        the colour and Root answered INTERNAL (13) rather than a validation
+        error. ``color_hex`` now defaults to None and falls back to the role's
+        current colour, or to ``DEFAULT_PICTURE_HEX`` when that is unknown.
+        """
         community_id = normalize_root_guid(community_id)
         role_id = normalize_root_guid(role_id)
+
+        # CommunityRoleEdit is a *replace*: Name, ColorHex, both permission
+        # sets and the two flags all go on the wire, and anything omitted is
+        # blanked. Fixing only ColorHex was not enough -- dropping the
+        # permission sets still made Root answer INTERNAL (13). Read the role
+        # once and carry forward every value the caller did not supply.
+        needs_current = (
+            color_hex is None
+            or community_permissions is None
+            or channel_permissions is None
+        )
+        current = None
+        if needs_current:
+            # The read is load-bearing, so its failure must not be swallowed.
+            # This used to be wrapped in ``except Exception: current = None``,
+            # which turned any transient failure -- a 429 cooldown, a
+            # PERMISSION_DENIED, a network blip -- into a *destructive*
+            # replace: colour reset to DEFAULT_PICTURE_HEX and both permission
+            # sets dropped from the payload, which is the very thing the
+            # comment above says makes Root answer INTERNAL (13). A partial
+            # ``edit_role(cid, rid, name="x")`` silently became "rename this
+            # role and wipe its permissions".
+            #
+            # ``edit_community`` does the same read-before-replace with no
+            # try/except at all; this now matches it.
+            extended = await self.community_service.get_extended(community_id)
+            current = next(
+                (r for r in extended.roles if r.id == role_id), None
+            )
+            if current is None:
+                raise ValueError(
+                    f"role {role_id} is not in community {community_id}, so "
+                    "the values you did not supply cannot be carried forward. "
+                    "CommunityRoleEdit is a replace: sending it now would "
+                    "blank the role's colour and permissions. Pass color_hex, "
+                    "community_permissions and channel_permissions explicitly "
+                    "to edit a role this client cannot read."
+                )
+
+        if color_hex is None:
+            color_hex = getattr(current, "color_hex", None) or DEFAULT_PICTURE_HEX
+        color_hex = normalize_hex_colour(color_hex, field_name="color_hex")
+
+        # CommunityRole names these `community_permissions` and, for the
+        # channel set, plain `permissions` -- not `channel_permissions`.
+        # Reading the wrong name returned None silently, so the field stayed
+        # omitted and Root kept answering INTERNAL even after the "fix".
+        if community_permissions is None:
+            community_permissions = getattr(current, "community_permissions", None)
+        if channel_permissions is None:
+            channel_permissions = getattr(current, "permissions", None)
+        if current is not None:
+            if not mentionable:
+                mentionable = bool(getattr(current, "is_mentionable", False))
+            if not self_assignable:
+                self_assignable = bool(
+                    getattr(current, "is_self_assignable", False)
+                )
 
         payload = bytearray()
         payload += length_field(1, self._context())

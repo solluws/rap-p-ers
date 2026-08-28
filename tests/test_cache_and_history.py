@@ -3,6 +3,8 @@
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+
 from rootpy import RootClient
 from rootpy.cache import LRUCache, StateCache
 from rootpy.events import MessageAction, MessageEvent
@@ -137,14 +139,18 @@ def test_community_detail_caches():
 
 # --- history iterator ----------------------------------------------------- #
 def test_history_paginates_and_dedupes():
+    # page_size is MessageList's Limit, which Root range-checks to 10..50, so
+    # the pages here are 10 long. This used to use 3 -- a value the server
+    # refuses outright, so the test was exercising a walk that could never
+    # happen against Root.
     async def run():
         client = RootClient()
         client.messages._token_getter = lambda: "token"
         pages = [
             [Message(id=f"m{i}", container_id="c", user_id="u",
                      content=str(i), community_id=None)
-             for i in range(start, start + 3)]
-            for start in (0, 3, 6)
+             for i in range(start, start + 10)]
+            for start in (0, 10, 20)
         ]
         # the last page repeats -- the iterator must stop, not loop
         pages.append(pages[-1])
@@ -156,14 +162,14 @@ def test_history_paginates_and_dedupes():
         collected = [
             message.content
             async for message in client.history("00000000-0000-0003-0000-000000000004",
-                                                page_size=3, limit=None)
+                                                page_size=10, limit=None)
         ]
         await client.close()
         return collected
 
     collected = asyncio.run(run())
-    assert len(collected) == 9
-    assert len(set(collected)) == 9      # no duplicates across pages
+    assert len(collected) == 30
+    assert len(set(collected)) == 30     # no duplicates across pages
 
 
 def test_history_respects_limit():
@@ -352,6 +358,115 @@ def test_notification_teaches_cache_a_username():
     assert gateway.client_cache.username(message.user_id) == "alice"
 
 
+# --- per-frame cost ------------------------------------------------------- #
+def _frame():
+    """A frame shaped like a real notification: container nested in message."""
+    from rootpy.protocol import length_field, string_field
+
+    def varint(value):
+        out = bytearray()
+        while True:
+            byte = value & 0x7F
+            value >>= 7
+            out.append(byte | (0x80 if value else 0))
+            if not value:
+                return bytes(out)
+
+    payload = bytearray()
+    payload += string_field(10, "0030bf26-999d-8101-82fd-66b280480024")
+    payload += string_field(12, "hello " * 20)
+    for number in range(14, 22):
+        payload += string_field(number, f"field-{number}-{'x' * 20}")
+
+    container = bytes(length_field(3, bytes(payload)))
+    message = bytes(length_field(2, container) + varint(1 << 3) + varint(42))
+    return message, container
+
+
+class TestSocketResponseDebugTreesAreOptIn:
+    """The two exploratory trees are a debugging aid, and they were not free.
+
+    ``_socket_response`` eagerly built ``data["notification"]`` and
+    ``data["packet_container"]`` on **every** frame, keepalive pings included.
+    ``_bytes_to_json`` hexes and UTF-8-decodes every length-delimited field and
+    recurses six levels, and ``packet_container``'s tree is a strict subtree of
+    ``notification``'s -- recomputed from scratch. Measured on a 556-byte
+    frame: 107.7 us of 169.1 us, 64% of the function, for output no library
+    code, test, devscript or example reads.
+
+    They are now opt-in. Both keys still exist, so the response shape is
+    unchanged; they simply carry ``None`` until asked for.
+    """
+
+    def _both(self):
+        from rootpy.gateway import Gateway
+
+        message, container = _frame()
+        off = Gateway._socket_response(message, 42, 3, container)
+        on = Gateway._socket_response(
+            message, 42, 3, container, debug_trees=True
+        )
+        return off, on
+
+    def test_the_keys_still_exist_either_way(self):
+        """Opting out must not change the shape, only the cost."""
+        off, on = self._both()
+        assert set(off) == set(on)
+        assert "notification" in off and "packet_container" in off
+
+    def test_they_are_empty_by_default(self):
+        off, _ = self._both()
+        assert off["notification"] is None
+        assert off["packet_container"] is None
+
+    def test_asking_for_them_still_works(self):
+        _, on = self._both()
+        assert on["notification"], "debug_trees=True must still build the tree"
+        assert on["packet_container"]
+
+    def test_everything_callers_actually_read_is_unchanged(self):
+        """``fields`` and ``packet`` are the keys with real consumers."""
+        off, on = self._both()
+        for key in ("fields", "packet", "raw_hex", "packet_raw_hex",
+                    "sequence", "packet_case"):
+            assert off[key] == on[key], f"{key} changed with debug_trees"
+
+    def test_the_default_is_off_on_a_real_gateway(self):
+        from rootpy.gateway import Gateway
+
+        gateway = Gateway(
+            hub_url="w", token="t", device_id="d", dispatch=lambda *a: None
+        )
+        assert gateway.decode_debug_trees is False
+
+    def test_skipping_them_is_actually_cheaper(self):
+        """The point of the change, asserted rather than assumed.
+
+        A loose bound -- the measured gap is ~2.9x -- so this fails only if
+        the trees are being built regardless of the flag.
+        """
+        import time
+
+        from rootpy.gateway import Gateway
+
+        message, container = _frame()
+
+        def timed(**kwargs):
+            for _ in range(50):            # warm
+                Gateway._socket_response(message, 42, 3, container, **kwargs)
+            started = time.perf_counter()
+            for _ in range(300):
+                Gateway._socket_response(message, 42, 3, container, **kwargs)
+            return time.perf_counter() - started
+
+        off = timed()
+        on = timed(debug_trees=True)
+        assert off < on / 1.5, (
+            f"debug trees off took {off*1000:.1f} ms vs on {on*1000:.1f} ms "
+            "-- the flag is not skipping the work"
+        )
+
+
 # --- resource bounds ------------------------------------------------------ #
 def test_message_cache_is_bounded():
     """An always-on watcher would otherwise retain every message it ever saw."""
@@ -403,6 +518,107 @@ def test_lru_cache_supports_dict_access():
     assert sorted(cache.keys()) == ["b", "c"]
 
 
+class TestMessageListLimitWindow:
+    """``Limit`` is optional, and when present must be 10..50.
+
+    LLMS.md said "MessageList must not include Limit; sending it gets the
+    request rejected" -- while ``history()``, the paging API the same document
+    recommends, sends ``Limit=page_size`` on every page and works. Both could
+    not be true, so it was laddered against the live API and Root answered in
+    its own words:
+
+        Limit: Must be between 10 and 50 [InclusiveBetweenValidator]
+
+    Measured: omitted -> OK (50 back); 1, 2, 5, 9 -> INVALID_ARGUMENT; 10-50 ->
+    OK returning exactly that many; 51, 55, 60, 75, 99, 100 -> INVALID_ARGUMENT.
+
+    Checked locally now, because the alternative is a round trip per page that
+    fails identically every time.
+    """
+
+    def _client(self):
+        client = RootClient()
+        client.messages._token_getter = lambda: "token"
+        return client
+
+    def test_the_window_matches_what_root_said(self):
+        from rootpy.services.messages import MessageService
+
+        assert MessageService.LIMIT_MIN == 10
+        assert MessageService.LIMIT_MAX == 50
+
+    @pytest.mark.parametrize("limit", [0, 1, 2, 5, 9, 51, 60, 100, 500])
+    def test_an_out_of_range_limit_raises_locally(self, limit):
+        async def run():
+            client = self._client()
+            sent = {"n": 0}
+
+            async def fake_unary(**kwargs):
+                sent["n"] += 1
+                raise AssertionError("a request should never have been made")
+
+            client.messages.transport.unary = fake_unary
+            try:
+                with pytest.raises(ValueError, match="between 10 and 50"):
+                    await client.messages.list("00000000-0000-0003-0000-000000000004",
+                                               limit=limit)
+            finally:
+                await client.close()
+            return sent["n"]
+
+        assert asyncio.run(run()) == 0, "it made a round trip to learn this"
+
+    @pytest.mark.parametrize("limit", [None, 10, 25, 50])
+    def test_an_in_range_limit_is_accepted(self, limit):
+        async def run():
+            client = self._client()
+            seen = {}
+
+            async def fake_list(container_id, **kwargs):
+                seen["limit"] = kwargs.get("limit")
+                return []
+
+            client.messages.list = fake_list
+            # go through history so the page_size path is covered too
+            got = [m async for m in client.history(
+                "00000000-0000-0003-0000-000000000004",
+                page_size=limit or 50, limit=None,
+            )]
+            await client.close()
+            return got, seen
+
+        got, seen = asyncio.run(run())
+        assert got == []
+        assert seen["limit"] == (limit or 50)
+
+    @pytest.mark.parametrize("page_size", [1, 3, 9, 51, 200])
+    def test_history_rejects_an_out_of_range_page_size_before_the_first_page(
+        self, page_size
+    ):
+        """Every page would fail the same way, so fail once, up front."""
+        async def run():
+            client = self._client()
+            calls = {"n": 0}
+
+            async def fake_list(container_id, **kwargs):
+                calls["n"] += 1
+                return []
+
+            client.messages.list = fake_list
+            try:
+                with pytest.raises(ValueError, match="between 10 and 50"):
+                    async for _ in client.history(
+                        "00000000-0000-0003-0000-000000000004",
+                        page_size=page_size,
+                    ):
+                        pass
+            finally:
+                await client.close()
+            return calls["n"]
+
+        assert asyncio.run(run()) == 0
+
+
 def test_history_stops_on_a_short_page():
     """A page shorter than requested means there's nothing older -- don't
     spend another round-trip discovering that."""
@@ -441,3 +657,122 @@ def test_history_stops_on_a_short_page():
     count, requests = asyncio.run(run(25, 10))
     assert count == 25
     assert requests == 3
+
+
+# --- history paging across real time --------------------------------------- #
+def _message_at(when, index):
+    """A message whose id encodes ``when``, the way Root's really do."""
+    from rootpy.identifiers import ROOT_GUID_START_DATE, format_root_guid
+
+    millis = int((when - ROOT_GUID_START_DATE).total_seconds() * 1000)
+    high64 = (millis << 16) + 0x8000 + 3          # 3 = ROOT_GUID_TYPE_MESSAGE
+    return Message(
+        id=format_root_guid(high64, index + 1),
+        container_id="c", user_id="u", content=str(index), community_id=None,
+    )
+
+
+class TestHistoryWalksPastTheFirstPage:
+    """The bug this class exists for truncated every busy channel silently.
+
+    ``history`` stepped its cursor back by ``page_size`` *seconds* between
+    pages, on the theory that the model carried no timestamp. A page of 50
+    messages spanning more than 50 seconds therefore put the next cursor back
+    inside the page just read; the server returned the same rows; the
+    duplicate check saw nothing fresh and returned, believing it had reached
+    the end.
+
+    Measured against a real channel before the fix: 50 messages walked, 1024
+    actually there. The existing paging tests missed it because their fake
+    ``list`` ignored the cursor and their ids were not Root GUIDs, so both
+    halves of the faulty step were invisible.
+    """
+
+    @staticmethod
+    def _server(total, span_seconds):
+        """A fake MessageList that honours ``after`` as an older-than cursor."""
+        from datetime import datetime, timedelta, timezone
+
+        base = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        gap = span_seconds / max(1, total - 1)
+        every = [
+            _message_at(base + timedelta(seconds=gap * i), i)
+            for i in range(total)
+        ]
+
+        async def fake_list(container_id, *, after=None, limit=50, **kwargs):
+            from rootpy.identifiers import root_guid_datetime
+
+            older = [
+                m for m in every
+                if after is None
+                or root_guid_datetime(m.id).timestamp() < after
+            ]
+            # Root returns oldest-first, newest page last.
+            return older[-limit:]
+
+        return fake_list, every
+
+    def _walk(self, total, span_seconds, page_size=50):
+        async def run():
+            client = RootClient()
+            client.messages._token_getter = lambda: "token"
+            client.messages.list, _every = self._server(total, span_seconds)
+            collected = [
+                m.content
+                async for m in client.history(
+                    "00000000-0000-0003-0000-000000000004",
+                    page_size=page_size, limit=None,
+                )
+            ]
+            await client.close()
+            return collected
+
+        return asyncio.run(run())
+
+    def test_it_reaches_the_oldest_message(self):
+        """120 messages over an hour: three pages, not one."""
+        collected = self._walk(total=120, span_seconds=3600)
+        assert len(collected) == 120
+        assert set(collected) == {str(i) for i in range(120)}
+
+    def test_a_page_spanning_days_still_advances(self):
+        """The failing shape: each page covers far more than page_size seconds."""
+        collected = self._walk(total=200, span_seconds=86400 * 7)
+        assert len(collected) == 200
+
+    def test_messages_closer_together_than_a_second_are_not_skipped(self):
+        """The other end: a burst inside one second must not lose rows.
+
+        The cursor steps to just *before* the page's oldest message, so
+        messages sharing a millisecond are still all returned -- the id
+        de-duplication, not the cursor, is what stops the repeat.
+        """
+        collected = self._walk(total=120, span_seconds=1)
+        assert len(collected) == 120
+
+    def test_it_still_terminates_when_ids_carry_no_time(self):
+        """Unparseable ids fall back to the fixed step rather than spinning."""
+        async def run():
+            client = RootClient()
+            client.messages._token_getter = lambda: "token"
+            pages = [[Message(id=f"x{i}", container_id="c", user_id="u",
+                              content=str(i), community_id=None)
+                      for i in range(start, start + 50)]
+                     for start in (0, 50)]
+
+            async def fake_list(container_id, **kwargs):
+                return pages.pop(0) if pages else []
+
+            client.messages.list = fake_list
+            collected = [
+                m.content
+                async for m in client.history(
+                    "00000000-0000-0003-0000-000000000004",
+                    page_size=50, limit=None,
+                )
+            ]
+            await client.close()
+            return collected
+
+        assert len(asyncio.run(run())) == 100

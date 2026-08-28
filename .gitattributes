@@ -1,0 +1,6 @@
+# This tree has deliberately mixed line endings: LLMS.md, README.md and
+# docs/changelog.md are CRLF, every other document and all Python is LF.
+# That is intentional and the test suite checks it, so git must not normalise
+# anything. `-text` disables end-of-line conversion in both directions, so a
+# checkout is byte-identical to what was committed.
+* -text

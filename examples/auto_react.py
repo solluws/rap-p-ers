@@ -4,13 +4,19 @@ Root renders each distinct reaction separately, so a list of heart variants
 gives a little wall of hearts under everything you post. This reacts only to
 your own messages (the default), from your single account.
 
-    python -m rootpy.examples.auto_react
+    python examples/auto_react.py
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+
+# Run from anywhere, installed or not: put the project root on sys.path.
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
 
 from rootpy import RootClient
 

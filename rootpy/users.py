@@ -20,6 +20,22 @@ class User:
     id: str
     username: Optional[str] = None
 
+    @property
+    def mention(self) -> str:
+        """This user, written the way Root writes mentions in message content.
+
+        ``[@name](root://user/<id>)`` -- a markdown link, not ``<@id>``. The
+        format comes from ``rootpy.commands.USER_MENTION_RE``, which has
+        parsed real Root messages since it was written; there was simply no
+        way to *produce* one, so callers guessed, and the live suite guessed
+        ``<@id>`` for a long time.
+
+        Mirrors :attr:`rootpy.models.Channel.mention`.
+        """
+        from .models import build_user_mention
+
+        return build_user_mention(self.id, self.username)
+
     async def call(self):
         return await self.client.calls.call_user(self)
 

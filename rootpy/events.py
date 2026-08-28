@@ -29,10 +29,15 @@ class ChannelAction(str, Enum):
 
 
 class CommunityLeaveReason(IntEnum):
+    # Wire values come from RootApp.WebApi.Shared.Enums/CommunityLeaveReason:
+    # Unspecified=0, User=1, Kicked=4, Banned=7. 2 and 3 are not on the wire at
+    # all -- with the old KICKED=2/BANNED=3 every real kick or ban fell through
+    # from_value() and decoded as UNKNOWN, indistinguishable from a parse miss.
+    # UNKNOWN keeps 0 deliberately: that is the app's Unspecified.
     UNKNOWN = 0
     LEFT = 1
-    KICKED = 2
-    BANNED = 3
+    KICKED = 4
+    BANNED = 7
 
     @classmethod
     def from_value(cls, value) -> "CommunityLeaveReason":

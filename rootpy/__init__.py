@@ -59,7 +59,11 @@ from .exceptions import (
     TurnstileRequired,
     UsernameAlreadyExists,
 )
-from .identifiers import normalize_root_guid
+from .identifiers import (
+    normalize_root_guid,
+    root_guid_datetime,
+    root_guid_type,
+)
 from .media import (
     MediaBackendInfo,
     media_backend_info,
@@ -91,15 +95,12 @@ from .permissions import (
     ChannelPermission,
     CommunityPermission,
     ActionNotApplicable,
+    CallActionError,
     ChannelPermissions,
     MissingPermissions,
     PermissionStateUnavailable,
 )
 from .services.assets import AssetService
-from .services.calls import (
-    AudioPlayback,
-    IceInfo,
-)
 from .services.direct_messages import (
     DirectMessage,
     DirectMessageService,
@@ -113,7 +114,17 @@ __all__ = [
     "RootClient",
     "ErrorInfo",
     "get_error_info",
+
+    # Multi-account hosting
+    "MultiClientHost",
+    "HostedAccount",
+    "Outcome",
     "format_root_error",
+
+    # Reading unread
+    "UnreadReader",
+    "UnreadChannel",
+    "is_unread",
 
     # Commands
     "Command",
@@ -154,6 +165,8 @@ __all__ = [
     "EmailAlreadyExists",
 
     "normalize_root_guid",
+    "root_guid_datetime",
+    "root_guid_type",
 
     # Models
     "AuthenticationSession",
@@ -174,6 +187,10 @@ __all__ = [
 
     # Permissions
     "ActionNotApplicable",
+    # The base the other three share. Exported so `except CallActionError`
+    # catches a refused mute/kick in one clause -- the subclasses were
+    # reachable before, their base was not.
+    "CallActionError",
     "ChannelPermissions",
     "MissingPermissions",
     "PermissionStateUnavailable",
@@ -272,6 +289,7 @@ from .root_exception import (
 
 from .enums import (
     ErrorCodeType,
+    PacketErrorCode,
     ContentFlagReason,
     NotificationType,
     MessageType,
@@ -290,10 +308,21 @@ from .typed_events import (
     FriendEvent,
     MemberEvent,
     MemberRoleEvent,
+    ReactionEvent,
     RoleEvent,
 )
 
 from .cache import LRUCache, StateCache
+
+from .validation import (
+    DEFAULT_PICTURE_HEX,
+    USERNAME_MAX_LENGTH,
+    USERNAME_MIN_LENGTH,
+    USERNAME_RULE,
+    normalize_hex_colour,
+    validate_nickname,
+    validate_username,
+)
 
 # The generated RPC registries are big and slow to import (~770 ms cold, about
 # half of total import time), and most programs never touch them. They load on
@@ -310,6 +339,10 @@ _LAZY_EXPORTS = {
     "StructuredMethod": "structured_api",
     "StructuredResult": "structured_api",
     "StructuredService": "structured_api",
+    # Voice: rootpy.services.calls pulls in the media support modules, so it
+    # is kept off the import path too.
+    "AudioPlayback": "services.calls",
+    "IceInfo": "services.calls",
 }
 
 
@@ -324,8 +357,19 @@ def __getattr__(name):
     globals()[name] = value        # cache it, so this happens once
     return value
 
-from .host import HostedAccount, MultiClientHost
+from .host import HostedAccount, MultiClientHost, Outcome
 
 from .models import DetailedMember, UserProfile
 
 from .stats import EndpointStats, TransportStats
+
+from .unread import UnreadChannel, UnreadReader, is_unread
+
+from .services.assets import Asset, AssetLink
+
+from .accounts import (
+    AccountFactory,
+    AlreadyCreatedError,
+    CreatedAccount,
+    TurnstileChallenge,
+)

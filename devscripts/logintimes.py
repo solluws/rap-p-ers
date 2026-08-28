@@ -5,6 +5,7 @@ Each mode is timed on the same account (and repeated), so the differences are
 the modes themselves rather than account or network variance. Request counts
 come from wrapping the transport, so you see exactly what each mode costs.
 
+
 THE MODES
 ---------
   minimal      login_token(preload_caches=False)
@@ -44,6 +45,12 @@ import sys
 import time
 from collections import Counter
 from pathlib import Path
+
+# Run from anywhere, installed or not: put the project root on sys.path.
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
 
 from rootpy import RootClient
 

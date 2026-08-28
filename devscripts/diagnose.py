@@ -22,6 +22,12 @@ import logging
 import os
 import sys
 
+# Run from anywhere, installed or not: put the project root on sys.path.
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+
 from rootpy import RootClient
 from rootpy.identifiers import encode_root_guid, normalize_root_guid
 from rootpy.protocol import encode_varint, field_key, length_field

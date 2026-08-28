@@ -5,7 +5,7 @@ written for automating *your own* account: sending your own messages, tidying
 your own profile, calling your own friends. Fill in the IDs at the top with
 values from your account and run it.
 
-    python -m rootpy.examples.quickstart
+    python examples/quickstart.py
 
 Two patterns are shown:
   * `one_shot()`  -- log in, do a batch of actions, log out. No event loop.
@@ -16,6 +16,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+
+# Run from anywhere, installed or not: put the project root on sys.path.
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
 
 from rootpy import RootClient
 
