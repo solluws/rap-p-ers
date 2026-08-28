@@ -16,7 +16,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+# httpx[socks] is a *test* requirement, not a runtime one. SOCKS support stays
+# optional for users (LLMS.md says so), but TestNothingEscapesTheProxy builds a
+# real httpx.AsyncClient with a socks5h:// url, and httpx raises ImportError for
+# that scheme without socksio. It passed locally only because socksio happened
+# to be installed; a clean runner failed.
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "httpx[socks]>=0.27"]
 # Voice / WebRTC. Never installed automatically -- rootpy raises
 # MediaDependencyMissing naming this extra instead of shelling out to pip.
 voice = [
