@@ -865,7 +865,7 @@ async client.clone_community(source_community_id: str, **kwargs)
 async client.close() -> None
       client.command(name: Optional[str] = None, *, aliases: Union[tuple[str, ...], list[str]] = (), owner_only: bool = True, description: str = '')
 async client.community_detail(community_id: str, *, refresh: bool = False)
-async client.connect() -> None
+async client.connect(*, announce_device: bool = True) -> None
 async client.create_account(*, username: str, password: str, email: str, access_token: Optional[str] = None, turnstile_token: Optional[str] = None, device_id: Optional[str] = None, command_prefix: str = '>', require_media: bool = False, transport = None, proxy: Optional[str] = None) -> RootClient
 async client.create_community(name: str, **kwargs)
 async client.deafen(deafened: bool = True) -> None
@@ -947,6 +947,7 @@ async client.send_friend_request(username: str)
 async client.send_once(token: str, container_id: str, content: str, *, community_id: Optional[str] = None, **kwargs)
       client.service(name: str)
 async client.set_online_status(status)
+async client.set_presence(status)
       client.set_user_id(user_id: str) -> None
 async client.start(username: Optional[str] = None, password: Optional[str] = None) -> None
 async client.start_token(token: Optional[str] = None, *, device_id: Optional[str] = None, web_api_url: str = 'https://api.rootapp.com/') -> None
@@ -970,11 +971,12 @@ async client.verify_email(verification_code: str, username: Optional[str] = None
 async client.wait_for(event: str, *, check = None, timeout: Optional[float] = None)
 async client.wait_until_ready() -> None
       client.watch_channel(container_id: str, *, community_id: Optional[str] = None, interval: float = 5.0, limit: int = 50)
+      client.watch_presence(on_change, *, users = None, poll = None)
       client.watch_unread(*, interval: float = 3.0, include_dms: bool = True, mark_read: bool = False, callback = None, concurrency: int = 8, community_refresh: float = 120.0, dm_every: int = 20)
 async client.whoami(*, refresh: bool = False) -> CurrentUser
 ```
 
-Properties (no parentheses, never awaited): `calls`, `device_id`, `hub_url`, `is_connected`
+Properties (no parentheses, never awaited): `calls`, `device_id`, `hub_url`, `is_connected`, `presence`
 
 `gen` entries are async generators — iterate with `async for`, do not await them.
 
@@ -1025,8 +1027,9 @@ async client.assets.url_for(uri) -> Optional[str]
 #### `client.auth` — AuthClient
 
 ```python
+async client.auth.hub_endpoint(token: str, device_id: str) -> str
 async client.auth.login(username: str, password: str) -> AuthenticationSession
-async client.auth.session_from_token(token: str, *, device_id: Optional[str] = None, web_api_url: str = 'https://api.rootapp.com/') -> AuthenticationSession
+async client.auth.session_from_token(token: str, *, device_id: Optional[str] = None, web_api_url: str = 'https://api.rootapp.com/', fetch_hub: bool = True) -> AuthenticationSession
 async client.auth.signup(username: str, password: str, email: str, *, access_token: Optional[str] = None, turnstile_token: Optional[str] = None, device_id: Optional[str] = None) -> AuthenticationSession
 ```
 
@@ -1109,11 +1112,14 @@ async client.community.get_member(community_id: str, user_id: str, *, refresh: b
 async client.community.get_members(community_id: str, *, refresh: bool = False) -> Tuple[CommunityMember, ...]
 async client.community.get_role(community_id: str, role_id: str, *, refresh: bool = False) -> Optional[CommunityRole]
 async client.community.get_roles(community_id: str, *, refresh: bool = False) -> Tuple[CommunityRole, ...]
+      client.community.held(community_id: str, *more) -> _HeldCommunities
+async client.community.hold(community_id: str) -> AttachHold
 async client.community.kick(community_id: str, user_id: str)
 async client.community.list(*, refresh: bool = True) -> Tuple[Community, ...]
 async client.community.move_channel(community_id: str, channel_id: str, *, old_group_id: Optional[str] = None, new_group_id: Optional[str] = None, before_channel_id: Optional[str] = None) -> None
 async client.community.move_channel_group(community_id: str, group_id: str, *, before_group_id: Optional[str] = None) -> None
 async client.community.move_role(community_id: str, role_id: str, *, before_role_id: Optional[str] = None) -> None
+async client.community.release(community_id: str) -> None
 async client.community.remove_role(community_id: str, user_id: str, role_id: str)
 async client.community.servers(*, refresh: bool = True) -> Tuple[Community, ...]
 async client.community.unban(community_id: str, user_id: str)
@@ -1583,8 +1589,10 @@ async community.leave() -> None
 
 ```python
 # fields: community, channel_groups, members, roles, raw
+      communityextended.is_attached(user_id: str) -> bool
       communityextended.member(user_id: str)
       communityextended.role(role_id: str)
+      communityextended.attached_user_ids    # property
       communityextended.channels    # property
       communityextended.text_channels    # property
 ```

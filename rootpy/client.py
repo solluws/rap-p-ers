@@ -241,6 +241,7 @@ class RootClient(HighLevelMixin):
         owns_transport: bool = True,
         preload_caches: bool = True,
         expand_communities: bool = False,
+        defer_hub: bool = False,
         message_cache_size: int = 2000,
         proxy: Optional[str] = None,
         preload_direct_messages: bool = False,
@@ -270,6 +271,15 @@ class RootClient(HighLevelMixin):
         # community -- 15+ heavy round-trips before the client is usable.
         # Off by default: communities expand on first access and are cached.
         self.expand_communities = bool(expand_communities)
+        #: Skip GetNewHubserverEndpoint at login and fetch it in connect()
+        #: instead. Login drops from two sequential hops to one; an account
+        #: that never connects never makes the call at all.
+        self.defer_hub = bool(defer_hub)
+        #: The device status this client last announced, for the other half of
+        #: ``min(ceiling, device)``. Zero means nothing has been announced
+        #: from here, which is the state that makes an account invisible no
+        #: matter how high its ceiling is. See :mod:`rootpy.presence`.
+        self._device_status = 0
         self.preload_direct_messages = bool(preload_direct_messages)
         # An optional outbound proxy, e.g. "socks5://127.0.0.1:1080".
         # Ignored when a transport is supplied -- configure it there instead.
@@ -1427,6 +1437,7 @@ class RootClient(HighLevelMixin):
             self.token,
             device_id=device_id,
             web_api_url=web_api_url,
+            fetch_hub=not self.defer_hub,
         )
         await self._initialize_authenticated_state()
 
@@ -1490,19 +1501,39 @@ class RootClient(HighLevelMixin):
             await client.close()
             raise
 
-    async def connect(self) -> None:
+    async def connect(self, *, announce_device: bool = True) -> None:
         """Open the gateway and start dispatching events.
 
         Requires a session: the gateway needs the hub URL and device id, and
         only a login produces those. A constructor token is enough for RPCs
         but not for this -- call :meth:`login_token` first (or
         :meth:`login`), then connect.
+
+        ``announce_device=False`` skips the ``SetDeviceOnlineStatus`` call
+        this normally makes on the caller's behalf, for a caller that has
+        already announced or means to do it itself. The announce is a round
+        trip and it is made *while connecting*, so a program bringing up many
+        accounts at once pays it inside whatever limit it puts on concurrent
+        handshakes; doing it separately lets it overlap with other work. The
+        default keeps the desktop client's behaviour, which is what a
+        connection Root will deliver to looks like.
         """
         if self.session is None:
             raise RuntimeError(
                 "connect() needs a session, which a constructor token alone "
                 "does not provide. Call login_token(token) or "
                 "login(username, password) first."
+            )
+        if not self.session.hub_url:
+            # Logged in with defer_hub: this is the first time the endpoint
+            # has actually been needed, so fetch it now.
+            from dataclasses import replace
+
+            self.session = replace(
+                self.session,
+                hub_url=await self.auth.hub_endpoint(
+                    self.session.token, self.session.device_id
+                ),
             )
         self.gateway = Gateway(
             hub_url=self.session.hub_url,
@@ -1519,7 +1550,8 @@ class RootClient(HighLevelMixin):
         self.gateway.client_cache = self.cache
         self.gateway.proxy = self.proxy or getattr(self.transport, "proxy", None)
         await self.gateway.start()
-        await self._announce_device_online()
+        if announce_device:
+            await self._announce_device_online()
         await self.dispatch(
             "ready",
             ReadyEvent(self.session.device_id, self.session.hub_url),
@@ -1548,6 +1580,10 @@ class RootClient(HighLevelMixin):
             await self.user_settings.set_device_online_status(
                 int(UserOnlineStatus.ACTIVE)
             )
+            # Remembered so ``client.presence`` can apply min(ceiling, device)
+            # without a request. Only set on success: claiming a device we
+            # never announced is how the property would start lying.
+            self._device_status = int(UserOnlineStatus.ACTIVE)
         except Exception as exc:                      # noqa: BLE001
             log.debug("could not announce device online status: %s", exc)
 

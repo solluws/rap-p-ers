@@ -25,8 +25,15 @@ def _httpx():
 
         _httpx_module = _module
     return _httpx_module
-from typing import Optional
+from typing import Callable, Iterable, Optional
 from urllib.parse import unquote
+
+#: gRPC status 8. Root's throttle, and it never sets HTTP 429 with it.
+GRPC_RESOURCE_EXHAUSTED = "8"
+
+#: The statuses retried by default: DEADLINE_EXCEEDED(4),
+#: RESOURCE_EXHAUSTED(8), ABORTED(10), INTERNAL(13), UNAVAILABLE(14).
+RETRYABLE_GRPC_STATUSES = frozenset({"4", "8", "10", "13", "14"})
 
 from .exceptions import (
     GrpcWebError,
@@ -95,6 +102,8 @@ class GrpcWebTransport:
         max_connections: int = 200,
         max_keepalive_connections: int = 100,
         proxy: Optional[str] = None,
+        retry_statuses: Optional[Iterable] = None,
+        should_retry: Optional[Callable[[str, str, int], bool]] = None,
     ) -> None:
         self._client: Optional["httpx.AsyncClient"] = None
         # Optional outbound proxy, e.g. "socks5://127.0.0.1:1080" for a
@@ -116,6 +125,28 @@ class GrpcWebTransport:
                 self.max_connections,
             ),
         )
+        #: Which gRPC statuses are worth trying again. The default is the
+        #: transient set, but Root does not always use them that way: posting
+        #: to a channel you are not a member of comes back as **14
+        #: (UNAVAILABLE)**, not PERMISSION_DENIED, and no number of retries
+        #: will ever make it work -- measured as 7 of 24 accounts failing
+        #: identically at concurrency 8 and at 64, having burned two retries
+        #: and two backoffs each. Narrow this, or pass ``should_retry``, when
+        #: you know which calls lie.
+        self.retry_statuses = frozenset(
+            str(s) for s in (
+                RETRYABLE_GRPC_STATUSES if retry_statuses is None
+                else retry_statuses
+            )
+        )
+        #: ``should_retry(endpoint, grpc_status, attempt) -> bool``, consulted
+        #: instead of :attr:`retry_statuses` when given.
+        self.should_retry = should_retry
+
+    def _is_retryable(self, endpoint: str, grpc_status: str, attempt: int) -> bool:
+        if self.should_retry is not None:
+            return bool(self.should_retry(endpoint, grpc_status, attempt))
+        return grpc_status in self.retry_statuses
 
     async def __aenter__(self):
         self._get_client()
@@ -343,7 +374,13 @@ class GrpcWebTransport:
             if grpc_status is not None and grpc_status != "0":
                 if challenge_url: raise TurnstileRequired(challenge_url)
                 error = make_grpc_error(operation, grpc_status, grpc_message, response_headers=dict(response.headers))
-                retryable = str(grpc_status) in {"4", "8", "10", "13", "14"}
+                # RESOURCE_EXHAUSTED is a throttle that never touches HTTP
+                # 429, so counting only 429 reported rate_limited=0 while
+                # calls were visibly being throttled -- the one number you
+                # reach for when a fan-out slows down, reading zero.
+                if str(grpc_status) == GRPC_RESOURCE_EXHAUSTED:
+                    self.stats.note_rate_limited(endpoint)
+                retryable = self._is_retryable(endpoint, str(grpc_status), attempt)
                 if retryable and attempt <= self.max_retries:
                     self.stats.note_retry(endpoint)
                     backoff = self.retry_base * (2 ** (attempt - 1)) + random.random()*0.1

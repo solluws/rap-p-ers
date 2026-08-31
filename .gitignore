@@ -17,6 +17,7 @@ token.txt
 
 # run output
 log.txt
+presencelog*.txt
 diag.txt
 run.txt
 *.log

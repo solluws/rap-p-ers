@@ -41,6 +41,59 @@ log = logging.getLogger("rootpy.host")
 
 SetupHook = Callable[[RootClient], Awaitable[None]]
 
+#: What one IP actually gets out of Root, measured across 1,307 accounts on
+#: one shared HTTP/2 transport. These are ceilings, not targets: pushing
+#: concurrency past them buys nothing and just moves the queue into the
+#: client, where it is harder to see.
+#:
+#: The important shape is that they are *not* all the same. Sizing a fan-out
+#: from the plain-RPC number makes attach look mysteriously slow, and sizing
+#: socket work from it is off by nearly an order of magnitude -- which is
+#: exactly the mistake that made a 1,307-account attach take 335 s before the
+#: handshakes were given their own, much narrower gate.
+MEASURED_CEILINGS = {
+    #: Ordinary unary calls -- messages, profiles, settings. 103-140/s
+    #: depending on the endpoint; treat 120 as the working number.
+    "rpc": 120.0,
+    #: Login is two RPCs (GetSelf and ListMine, gathered), so it caps at half
+    #: the plain-RPC rate. ``RootClient(defer_hub=True)`` removes a third
+    #: hop and is what takes it from ~39/s to ~61/s.
+    "login": 60.0,
+    #: CommunityAttach measured on its own, with nothing else in flight.
+    "attach": 87.0,
+    #: Websocket handshakes. The odd one out by a wide margin, and the reason
+    #: socket work needs its own gate rather than sharing the RPC one.
+    "connect": 17.0,
+}
+
+#: The most accounts :meth:`MultiClientHost.broadcast` runs at once when it
+#: picks the number itself. Measured: 8 -> 28.3 s, 32 -> 7.3 s, 64 -> 3.8 s,
+#: 128 -> 2.0 s for one command across 1,089 accounts. 128 is faster still,
+#: but it buys 1.8 s while doubling the load one IP puts on Root, and the
+#: plain-RPC ceiling is ~120/s either way. 64 is the point where more
+#: concurrency stops being worth it.
+DEFAULT_MAX_CONCURRENCY = 64
+
+#: The floor, so a small host behaves exactly as it did before. Any host with
+#: 8 accounts or fewer has more permits than accounts, so nothing changes.
+DEFAULT_MIN_CONCURRENCY = 8
+
+
+def resolve_concurrency(requested: Optional[int], account_count: int) -> int:
+    """How many accounts to run at once, when the caller did not say.
+
+    A flat default cannot be right for both sizes of host. 8 is sensible for
+    five accounts and very wrong for a thousand: at 1,089 accounts and a
+    200 ms round trip it makes every command take 28 s. Documenting that was
+    not enough, because the caller has to read the docstring to find out.
+    """
+    if requested is not None:
+        return max(1, int(requested))
+    return min(
+        DEFAULT_MAX_CONCURRENCY,
+        max(DEFAULT_MIN_CONCURRENCY, int(account_count)),
+    )
+
 
 @dataclass
 class HostedAccount:
@@ -437,7 +490,7 @@ class MultiClientHost:
         action: Callable[[RootClient], Awaitable],
         *,
         only: Optional[list] = None,
-        concurrency: int = 8,
+        concurrency: Optional[int] = None,
         timeout: Optional[float] = 60.0,
     ) -> dict[str, Outcome]:
         """Run one action as every account, concurrently. Never raises.
@@ -458,13 +511,22 @@ class MultiClientHost:
         outcome saying so rather than being silently skipped.
 
         only:        run as just these account names.
-        concurrency: how many accounts act at once.
+        concurrency: how many accounts act at once. ``None`` (the default)
+                     scales with the number of accounts, capped at
+                     :data:`DEFAULT_MAX_CONCURRENCY`. It used to be a flat 8,
+                     which suits a handful of accounts and is badly wrong for
+                     a lot of them: at 1,089 accounts and a 200 ms round trip
+                     that is 28 s for every command, and the only warning was
+                     a line in this docstring. Pass a number to override it.
+                     See :data:`MEASURED_CEILINGS` for what Root will take.
         timeout:     per-account; a slow account becomes a TimeoutError
                      outcome instead of stalling the whole broadcast.
                      ``None`` disables it.
         """
         names = list(only) if only is not None else list(self.accounts)
-        limiter = asyncio.Semaphore(max(1, int(concurrency)))
+        limiter = asyncio.Semaphore(
+            resolve_concurrency(concurrency, len(names))
+        )
         results: dict[str, Outcome] = {}
 
         async def run_one(name: str) -> None:

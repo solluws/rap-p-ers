@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import replace
 from typing import TYPE_CHECKING, List, Optional, Union
 
 from .commands import parse_channel_mention, parse_user_mention
@@ -496,27 +497,101 @@ class HighLevelMixin:
                 entry for entry in self._waiters if entry[2] is not future
             ]
 
-    async def set_online_status(self, status):
+    async def set_presence(self, status):
         """Set your presence: ``"online"``, ``"idle"``, or ``"invisible"``.
 
-            await client.set_online_status("idle")
+            await client.set_presence("idle")
+
+        Root computes what others see as ``min(ceiling, device)`` -- see
+        :mod:`rootpy.presence`. This sets **both**, which is what makes it
+        actually take effect: setting only the ceiling (the bare
+        ``UserGrpcService/SetMaxOnlineStatus`` call) leaves an account that
+        never announced a device invisible to everyone, and both requests
+        return success while it happens.
 
         Root has no do-not-disturb state; presence is active / inactive /
         disconnected.
         """
-        return await self.users.set_online_status(status)
+        resolved = await self.users.set_online_status(status)
+        try:
+            await self.user_settings.set_device_online_status(int(resolved))
+        except Exception as exc:                              # noqa: BLE001
+            # The ceiling did land, so the account is not left in a state
+            # nobody asked for -- but it is not visible either, and silently
+            # returning the ceiling would be the exact lie this method exists
+            # to stop telling.
+            raise RuntimeError(
+                f"presence ceiling was set to {resolved.name} but the device "
+                f"status could not be announced, so the account is not "
+                f"visible as {resolved.name}: {type(exc).__name__}: {exc}"
+            ) from exc
+        self._device_status = int(resolved)
+        if getattr(self, "user", None) is not None:
+            self.user = replace(self.user, max_online_status=int(resolved))
+        return resolved
+
+    async def set_online_status(self, status):
+        """Alias for :meth:`set_presence`.
+
+        Named after the protocol call; :meth:`set_presence` is named after
+        what it does. For the ceiling on its own -- rarely what you want --
+        use ``client.users.set_online_status``.
+        """
+        return await self.set_presence(status)
+
+    @property
+    def presence(self):
+        """What this client has made others see: ``min(ceiling, device)``.
+
+        Reports what *this* client knows. Another session on the same account
+        can announce its own device and raise the real answer above this;
+        ``await client.get_profile(client.user_id)`` is the server's opinion.
+        """
+        from .presence import effective_presence
+
+        return effective_presence(
+            getattr(getattr(self, "user", None), "max_online_status", 0),
+            getattr(self, "_device_status", 0),
+        )
+
+    def watch_presence(self, on_change, *, users=None, poll=None):
+        """Call ``on_change(user_id, status)`` when someone's presence moves.
+
+            watch = client.watch_presence(print, users=ids, poll=5)
+            ...
+            await watch.stop()
+
+        There are two routes and they have different requirements:
+
+        * **push** -- ``USER_SET_STATUS`` packets. Instant and free, but the
+          hub only sends them for communities this connection has attached,
+          so pair it with ``client.community.held(...)``. No attach, no
+          packets, no error.
+        * **poll** -- ``GetExtendedUsersById`` every ``poll`` seconds. Needs
+          no attach and no socket, and batches every watched user into one
+          request per tick.
+
+        Push is always on. Pass ``poll`` to add the second route, and
+        ``users`` to say who to report on (required for polling, optional as
+        a filter for push). Also usable as ``async with``.
+        """
+        from .presence import PresenceWatch
+
+        return PresenceWatch(
+            self, on_change, users=users, poll=poll
+        ).start()
 
     async def go_online(self):
-        """Shorthand for ``set_online_status("online")``."""
-        return await self.set_online_status("online")
+        """Shorthand for ``set_presence("online")``."""
+        return await self.set_presence("online")
 
     async def go_idle(self):
-        """Shorthand for ``set_online_status("idle")``."""
-        return await self.set_online_status("idle")
+        """Shorthand for ``set_presence("idle")``."""
+        return await self.set_presence("idle")
 
     async def go_invisible(self):
-        """Shorthand for ``set_online_status("invisible")``."""
-        return await self.set_online_status("invisible")
+        """Shorthand for ``set_presence("invisible")``."""
+        return await self.set_presence("invisible")
 
     async def get_profile(self, user_id: str):
         """A user's public profile: username, pictures, about-me, status.

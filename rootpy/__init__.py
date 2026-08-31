@@ -126,6 +126,11 @@ __all__ = [
     "UnreadChannel",
     "is_unread",
 
+    # Presence and attach lifetime
+    "AttachHold",
+    "PresenceWatch",
+    "effective_presence",
+
     # Commands
     "Command",
     "CommandArgumentError",
@@ -364,6 +369,10 @@ from .models import DetailedMember, UserProfile
 from .stats import EndpointStats, TransportStats
 
 from .unread import UnreadChannel, UnreadReader, is_unread
+
+from .attach import AttachHold
+
+from .presence import PresenceWatch, effective_presence
 
 from .services.assets import Asset, AssetLink
 

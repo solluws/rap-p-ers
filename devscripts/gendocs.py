@@ -189,6 +189,14 @@ def namespaces(client) -> list[str]:
             continue
         if not str(type(value).__module__).startswith("rootpy"):
             continue
+        # A namespace, not a value. rootpy's enums subclass int, so
+        # `client.presence` -> UserOnlineStatus otherwise passed every test
+        # above and documented itself as bit_count(), to_bytes() and the rest
+        # of the int API -- eight lines describing the integer, and nothing
+        # about the presence.
+        if isinstance(value, (int, float, complex, str, bytes, bytearray,
+                              tuple, frozenset, set, list, dict)):
+            continue
         if not public_callables(value):
             continue
         found.setdefault(id(value), []).append(name)

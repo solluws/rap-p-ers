@@ -17,6 +17,32 @@ Three deliberate choices, because they are what make it usable:
 **No gateway.** ``gateway=False`` throughout. Nothing here reads packets, and
 the websocket handshake is the slowest part of bringing an account up -- so
 skipping it is most of the startup time for a fan-out that only writes.
+``,presence`` is the one command that has to work around this: what others see
+is the lower of a *ceiling* and a *device* status, and it is the gateway that
+normally announces the device, so it sends both halves itself. The result
+outlives the process -- an account set online here stays online with nothing
+running, and ``,presence invisible`` is how it comes back.
+
+That is the *profile* status -- the friends list, the profile card, a DM
+header. It is **not** a community's member sidebar, which is attach-gated:
+``Member.updateCommunityOnlineStatus`` renders a member Offline unless it is
+attached to that community or is your friend, whatever its status says. An
+attach does register without a gateway -- the account appears in
+``CommunityGetExtendedResponse.AttachedUserIds`` -- but the server drops it
+again within 20-30s when there is no hub connection behind it (measured: still
+attached at +16s, gone by +31s).
+
+**``,attach <community>`` is the way round that**, and it pays for itself
+rather than making startup pay. It opens a socket for the accounts it is
+given, attaches them, and :class:`AttachKeeper` keeps them there -- the
+subscription dies with the connection, so a socket that drops has to be put
+back and re-attached. ``,detach`` drops the socket again when an account is
+holding nothing, so an idle fan-out holds no connections at all. The sockets
+it does hold have the gateway's four-second resync cycle turned off, since
+that exists to deliver messages nothing here reads.
+
+Attaching is visible -- other members see every attached account arrive at
+once -- so nothing attaches on its own.
 
 **Nothing blocks the prompt.** Each command is dispatched as its own task and
 the reader loops straight back round, so you can queue ``,join`` behind a slow
@@ -68,6 +94,7 @@ from _paths import provisioned_file, tokens_file                 # noqa: E402
 
 from rootpy import MultiClientHost                               # noqa: E402
 from rootpy.emoji import normalize_reaction                      # noqa: E402
+from rootpy.enums import UserOnlineStatus                        # noqa: E402
 from rootpy.exceptions import GrpcFailedPrecondition             # noqa: E402
 from rootpy.identifiers import normalize_root_guid               # noqa: E402
 from rootpy.models import Message                                # noqa: E402
@@ -976,6 +1003,23 @@ def p_word(raw: str) -> dict:
     return {"word": tokens[0][0]}
 
 
+def p_presence(raw: str) -> dict:
+    # Resolve the name here rather than in the action: a typo should cost one
+    # line before anything is sent, not N identical ValueErrors after every
+    # account has already been asked.
+    tokens = tokenize(raw)
+    if len(tokens) != 1:
+        raise NotFound("expected exactly one word")
+    try:
+        return {"status": UserOnlineStatus.from_name(tokens[0][0])}
+    except ValueError:
+        raise NotFound(
+            f"{tokens[0][0]!r} is not a presence -- use online, idle or "
+            "invisible (active, away, inactive, offline and disconnected "
+            "work too). Root has no do-not-disturb state."
+        ) from None
+
+
 def p_container_text(raw: str) -> dict:
     container_id, community_id, cursor = parse_container(raw, need_after=1)
     content = _rest(raw, cursor)
@@ -1266,6 +1310,158 @@ async def a_leave(client, *, community_id):
     return await client.community_service.leave(community_id)
 
 
+#: Opening a hub socket is the slowest thing here by an order of magnitude --
+#: ~6s of server-side latency each, against ~200-600ms for any RPC -- so this
+#: is the number that decides how long ,attach takes.
+#:
+#: Measured against the real ledger, connects per second by gate width:
+#: 8 -> 6.1, 24 -> 9.9, 64 -> 15.2, 128 -> 16.7, 256 -> 17.0, 512 -> 17.2.
+#: The hub saturates at ~17/s; past that the gate only inflates per-connect
+#: latency (6s at 120 accounts in flight, 14s at 250) without delivering more.
+#:
+#: Handshakes in flight are what make every other call slow -- the same
+#: Attach costs 248ms alone and 1157ms alongside them -- but ``ATTACHING`` is
+#: what keeps the two apart now, not this. Sized narrow it only makes the
+#: ramp crawl: at 16, a 1,307-account fleet took on sockets at 4.4/s, a
+#: quarter of what the hub offers.
+HANDSHAKES = asyncio.Semaphore(64)
+
+#: ,attach is capped by the server, not by us: measured over 400 accounts,
+#: throughput is 5.9/s at 16 in flight, 5.9/s at 32 and 6.3/s at 64 -- flat --
+#: while the Attach round trip inflates 969ms -> 1794ms -> 5769ms across the
+#: same range. The extra concurrency buys nothing and costs latency, and a
+#: 17s round trip at full scale is uncomfortably close to broadcast's 45s
+#: timeout. So this holds the pipeline near the knee regardless of what
+#: --concurrency is set to, which is still free to be wide for everything
+#: else. It is a robustness win, not a speed one: ~6/s is the server's number.
+ATTACHES = asyncio.Semaphore(24)
+
+
+class Busy:
+    """A counter of commands in flight, so background work can stand aside.
+
+    Opening sockets and issuing attaches are cheap separately and expensive
+    together: an Attach costs 248ms on its own and 1157ms next to a handshake
+    storm. The keeper's socket work is never urgent -- a refresh holds the
+    member-list place meanwhile -- so it waits for the command to finish
+    rather than competing with it. Measured at 400 accounts, letting them
+    overlap turned a 4.4s attach into 76.6s.
+    """
+
+    def __init__(self) -> None:
+        self.count = 0
+
+    def __enter__(self) -> "Busy":
+        self.count += 1
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.count -= 1
+
+    def __bool__(self) -> bool:
+        return self.count > 0
+
+
+ATTACHING = Busy()
+
+
+async def announce_device_once(client) -> None:
+    """Send SetDeviceOnlineStatus for this account, at most once per run.
+
+    Presence is the lower of a ceiling and this device status, so it has to
+    be sent -- but only once: it persists server-side, and ``connect()``
+    re-sends it on any socket it opens with the default announce. Sending it
+    per command doubled the round trips of the commonest one.
+    """
+    if getattr(client, "_fanout_device_announced", False):
+        return
+    await client.user_settings.set_device_online_status(
+        int(UserOnlineStatus.ACTIVE)
+    )
+    client._fanout_device_announced = True
+
+
+async def hold_socket(client) -> None:
+    """Bring one account's gateway up, tuned for presence rather than reading.
+
+    Two things, both about not paying for message delivery nobody reads:
+
+    **The socket is opened here, not at startup.** Logging in is one round
+    trip; adding a websocket handshake to it roughly doubles the cost of
+    bringing an account up (measured: login 1.1s, connect 1.0s), and a
+    fan-out that never attaches would pay it for every account for nothing.
+
+    **``resync_interval`` is turned off.** The gateway closes and reopens the
+    socket every four seconds by design -- that is how channel messages
+    arrive, in a batch per connection. Nothing here reads messages, so it is
+    a TLS handshake per account every four seconds for nothing. Measured over
+    a 40s window: 13.5 reconnects/min with it on, 3.0 with it off, and the
+    attach held in both. The remaining three are the hub closing an idle
+    connection, which reconnects immediately because pings count as data.
+    """
+    if not client.is_connected:
+        async with HANDSHAKES:
+            # Re-check inside the gate: a queue of callers for the same
+            # account would otherwise each open a socket in turn.
+            if not client.is_connected:
+                # announce_device=False: connect() would make that round trip
+                # here, inside the gate, where it is the one thing serialising
+                # behind the handshake. a_attach makes it alongside the attach
+                # instead, where it costs nothing extra.
+                await client.connect(announce_device=False)
+    if client.gateway is not None:
+        client.gateway.resync_interval = 0.0
+        # Heartbeat, slowed. The default 6-8s is sized for a socket that is
+        # reading; this one only has to stay alive. Measured over 60s at each
+        # cadence: 6-8s cost 9 frames/min, 20-25s cost 4 and held the attach
+        # just as well, and 45-50s lost it -- the hub stopped resuming the
+        # session while the socket still looked up, which is the one failure
+        # the keeper cannot see. 20-25s halves the traffic with the far side
+        # of the cliff measured, not guessed.
+        client.gateway.ping_interval_min = 20.0
+        client.gateway.ping_interval_max = 25.0
+
+
+async def a_attach(client, *, community_id):
+    # Attach is what puts an account in a community's member list --
+    # Member.updateCommunityOnlineStatus renders anyone who is neither
+    # attached nor your friend as Offline, whatever their status says. It
+    # needs a socket to live on, so this brings one up rather than requiring
+    # the whole fan-out to have been started with one. The keeper remembers
+    # it so a reconnect does not quietly undo it.
+    # No socket here. Attach on its own is the cheapest call in this file --
+    # 400 accounts in 4.4s, 87/s, 248ms median -- while opening a hub socket
+    # takes ~6s and the hub only accepts ~17 of those a second. Waiting for
+    # one per account is what made this take minutes: the same 400 accounts
+    # cost 58.4s, 6.85/s, with the attach round trip inflated to 1157ms by
+    # queueing behind the handshake. The socket is what makes an attach
+    # durable, not what makes it work, so the keeper opens them behind this
+    # and holds the place with a cheap refresh until they land.
+    with ATTACHING:
+        async with ATTACHES:
+            await asyncio.gather(
+                client.community.attach(community_id),
+                announce_device_once(client),
+            )
+    KEEPER.hold(client, community_id)
+    return community_id
+
+
+async def a_detach(client, *, community_id):
+    KEEPER.release(client, community_id)
+    # Same standing-aside as ,attach: a detach across a large fleet was
+    # measured at 166.7s while the keeper carried on opening sockets
+    # underneath it, against 1.7s for the same call with the field clear.
+    with ATTACHING:
+        result = await client.community.detach(community_id)
+    # Holding nothing means needing no socket. Dropping it is the difference
+    # between a fan-out that idles at zero connections and one that idles at
+    # one per account.
+    if not KEEPER.holds_any(client) and client.is_connected:
+        await client.gateway.close()
+    return result
+
+
 async def a_invite(client, *, community_id, max_uses):
     return await client.invites.create(community_id, max_uses=max_uses)
 
@@ -1304,8 +1500,25 @@ async def a_status(client, *, text):
     return await client.users.set_status(text)
 
 
-async def a_presence(client, *, word):
-    return await client.users.set_online_status(word)
+async def a_presence(client, *, status):
+    # Presence is two independent values, and the ceiling alone is invisible.
+    # What everyone else sees is the lower of SetMaxOnlineStatus (the user's
+    # choice) and the *device* status, which a real client announces on every
+    # connect and reconnect. These accounts run gateway=False, so nothing ever
+    # announced one, and this command only ever set the ceiling -- measured
+    # against a second account, a gatewayless account left at ceiling ACTIVE
+    # still read DISCONNECTED for as long as it was watched, and read ACTIVE
+    # within a second of the device half being sent. It then held with no
+    # socket open at all, which is what makes this worth doing here rather
+    # than by bringing a gateway up.
+    #
+    # Ceiling first, then device: the other order flashes an account online
+    # for a moment when the ceiling it is coming from is higher than the one
+    # it is going to, which is exactly the case ,presence invisible cares
+    # about. Ceiling first, min() covers the gap.
+    resolved = await client.users.set_online_status(status)
+    await announce_device_once(client)
+    return resolved
 
 
 async def a_bio(client, *, text):
@@ -1354,6 +1567,16 @@ def r_plain(value) -> str:
     return str(value or "")
 
 
+def r_presence(value) -> str:
+    # The protocol name, not the word that was typed: "invisible" and
+    # "offline" are the same DISCONNECTED, and the line should say which.
+    try:
+        status = UserOnlineStatus.coerce(int(value))
+    except (TypeError, ValueError):
+        return ""
+    return f"{status.name.lower()}({int(status)})"
+
+
 @dataclasses.dataclass
 class Command:
     name: str
@@ -1396,6 +1619,12 @@ COMMANDS: list[Command] = [
     Command("leave", "<community>",
             "leave a community",
             p_community, a_leave),
+    Command("attach", "<community>",
+            "hold a place in a community's member list",
+            p_community, a_attach),
+    Command("detach", "<community>",
+            "stop holding a place in a community's member list",
+            p_community, a_detach),
     Command("invite", "<community> [max-uses]",
             "create an invite code for a community",
             p_community_maybe_int, a_invite, r_invite),
@@ -1427,8 +1656,8 @@ COMMANDS: list[Command] = [
             "set the custom status",
             p_text, a_status),
     Command("presence", "<online|idle|invisible>",
-            "set the presence",
-            p_word, a_presence),
+            "set the presence (visible without a gateway)",
+            p_presence, a_presence, r_presence),
     Command("bio", "<text>",
             "set the profile description",
             p_text, a_bio),
@@ -1466,6 +1695,219 @@ class Console:
 
 
 OUT = Console()
+
+
+class AttachKeeper:
+    """Holds community attaches open across reconnects, per account.
+
+    An attach lives with the hub connection: drop the socket and the server
+    forgets it, silently, and the account vanishes from the member list while
+    still looking perfectly logged in. So a fan-out that wants to *hold* a
+    place in a sidebar needs two things -- a socket for each account holding
+    one, which ``,attach`` opens, and something to redo the attach every time
+    one of those sockets comes back, which is this.
+
+    Without a socket the attach is not merely lost on reconnect, it decays on
+    its own, which is why ``,attach`` opens one. Both halves measured
+    against a second account reading
+    ``CommunityGetExtendedResponse.AttachedUserIds``: an attach made with no
+    gateway at all was still there at +16s and gone by +31s, and one whose
+    socket was killed under it survived +36s and was gone by +48s. With the
+    keeper running, the same kill was noticed in under a second and the
+    account was back in the member list 6s later.
+
+    Held sets are per account, so ``,only alice ,detach X`` stops holding X
+    for alice and leaves everyone else's alone. Watching ``is_connected`` is a
+    local flag read, so an idle keeper costs nothing.
+    """
+
+    POLL = 1.0
+
+    #: A socket that will not come back should not be retried every second.
+    #: The first attempt is immediate; this bounds the ones after it.
+    REVIVE_EVERY = 15.0
+
+    #: How often to re-send the attach for an account that has no socket yet.
+    #: A socketless attach decays on its own -- present at +16s, gone by +31s
+    #: -- and a socket takes ~6s to get, throttled to ~17/s by the hub, so at
+    #: any scale most accounts are waiting. Refreshing is affordable because
+    #: Attach on its own runs at 87/s; it is only expensive when it queues
+    #: behind handshakes, which is why HANDSHAKES is deliberately narrow.
+    #: Each refresh is a COMMUNITY_MEMBER_ATTACH other members see, so it
+    #: stops the moment the account has a socket of its own.
+    REFRESH_EVERY = 15.0
+
+    def __init__(self) -> None:
+        self.host: Optional[MultiClientHost] = None
+        self.held: dict[str, set] = {}
+        self.task: Optional[asyncio.Task] = None
+        #: name -> was it connected last time round. Seeded on first sight so
+        #: startup is not mistaken for a reconnect.
+        self._connected: dict[str, bool] = {}
+        #: name -> when its socket was last revived, monotonic.
+        self._revived: dict[str, float] = {}
+        #: id(client) -> account name, so the lookup is not a scan.
+        self._names: dict[int, str] = {}
+        #: name -> when its socketless attach was last refreshed, monotonic.
+        self._refreshed: dict[str, float] = {}
+        #: accounts with work in flight, so the poll does not queue it twice.
+        self._working: set = set()
+        self._tasks: set = set()
+
+    @property
+    def running(self) -> bool:
+        return self.task is not None and not self.task.done()
+
+    def start(self, host: MultiClientHost) -> None:
+        self.host = host
+        if not self.running:
+            self.task = asyncio.create_task(self._loop(), name="attach-keeper")
+
+    async def stop(self) -> None:
+        for task in list(self._tasks):
+            task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks.clear()
+        self._working.clear()
+        if self.task is not None:
+            self.task.cancel()
+            try:
+                await self.task
+            except (asyncio.CancelledError, Exception):        # noqa: BLE001
+                pass
+            self.task = None
+
+    def _name_for(self, client) -> Optional[str]:
+        # Cached by object identity. This is called once per account per
+        # ,attach, and a linear scan of the host would make that O(N^2) --
+        # 1.7M comparisons at 1,300 accounts, for a lookup that never changes.
+        key = id(client)
+        name = self._names.get(key)
+        if name is not None:
+            return name
+        for candidate, account in (
+            self.host.accounts.items() if self.host else ()
+        ):
+            if account.client is client:
+                self._names[key] = candidate
+                return candidate
+        return None
+
+    def hold(self, client, community_id: str) -> None:
+        name = self._name_for(client)
+        if name is not None:
+            self.held.setdefault(name, set()).add(community_id)
+
+    def release(self, client, community_id: str) -> None:
+        name = self._name_for(client)
+        if name is not None:
+            self.held.get(name, set()).discard(community_id)
+
+    def holds_any(self, client) -> bool:
+        name = self._name_for(client)
+        return bool(name is not None and self.held.get(name))
+
+    def summary(self) -> str:
+        holding = {n: c for n, c in self.held.items() if c}
+        if not holding:
+            return "holding nothing"
+        communities = sorted({c for ids in holding.values() for c in ids})
+        return (f"{len(holding)} account(s) holding "
+                f"{len(communities)} community(ies)")
+
+    def _spawn(self, name: str, coro) -> None:
+        """Run one account's upkeep off the poll loop.
+
+        The poll used to ``await`` this inline, which meant one account at a
+        time: a socket takes ~6s to open, so a thousand accounts would have
+        taken over an hour to work through. Each account's work is its own
+        task; ``hold_socket``'s own gate is what bounds them.
+        """
+        self._working.add(name)
+        task = asyncio.create_task(coro, name=f"keeper:{name}")
+        self._tasks.add(task)
+
+        def finished(done: asyncio.Task) -> None:
+            self._tasks.discard(done)
+            self._working.discard(name)
+            if not done.cancelled() and done.exception() is not None:
+                OUT.say(f"  {name}: keeper: {done.exception()!r}")
+
+        task.add_done_callback(finished)
+
+    async def _attach_all(self, name: str, client, wanted) -> None:
+        for community_id in wanted:
+            try:
+                await client.community.attach(community_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:                           # noqa: BLE001
+                OUT.say(f"  {name}: re-attach failed: "
+                        f"{type(exc).__name__}: {exc}")
+
+    async def _tend(self, name: str, client, wanted, *, revive: bool) -> None:
+        if revive:
+            try:
+                await hold_socket(client)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:                           # noqa: BLE001
+                OUT.say(f"  {name}: could not connect: "
+                        f"{type(exc).__name__}: {exc}")
+                return
+            self._connected[name] = bool(
+                getattr(client, "is_connected", False)
+            )
+        # A fresh connection means a fresh subscription: the attach lives
+        # with the socket, not with the account. A socketless refresh lands
+        # here too -- same call, different reason.
+        await self._attach_all(name, client, wanted)
+        self._refreshed[name] = time.monotonic()
+
+    async def _loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.POLL)
+            if self.host is None:
+                continue
+            now = time.monotonic()
+            for name, account in list(self.host.accounts.items()):
+                if name in self._working:
+                    continue
+                client = account.client
+                wanted = sorted(self.held.get(name, ()))
+                if client is None or not wanted:
+                    continue
+
+                # ``is_connected`` is coarser than it looks: the hub's
+                # ordinary close-1000-and-resume cycle does not clear it, so
+                # a False here is not a blip -- the gateway task has ended,
+                # or was never started because ,attach no longer waits for
+                # one. Either way this account needs a socket.
+                connected = bool(getattr(client, "is_connected", False))
+                was = self._connected.get(name, connected)
+                self._connected[name] = connected
+
+                if connected:
+                    if not was:                    # socket just came back
+                        self._spawn(name, self._tend(
+                            name, client, wanted, revive=False))
+                    continue
+
+                if (not ATTACHING
+                        and now - self._revived.get(name, 0.0)
+                        >= self.REVIVE_EVERY):
+                    self._revived[name] = now
+                    self._spawn(name, self._tend(
+                        name, client, wanted, revive=True))
+                elif now - self._refreshed.get(name, 0.0) >= self.REFRESH_EVERY:
+                    # Still queued behind the hub's handshake ceiling. Keep
+                    # the member-list place from decaying while it waits.
+                    self._spawn(name, self._tend(
+                        name, client, wanted, revive=False))
+
+
+KEEPER = AttachKeeper()
 
 
 class Session:
@@ -1643,6 +2085,42 @@ class Session:
         OUT.say(f"\n  {len(selected)} of {len(self.host.accounts)} selected"
                 f" (* acts on commands)\n")
 
+    def show_stats(self, raw: str) -> None:
+        """Where a slow command actually went, per endpoint.
+
+        A fan-out that takes minutes has three possible culprits and they want
+        opposite fixes, so guessing between them is expensive:
+
+          roundtrip -- the server was slow. Concurrency is the lever.
+          wait      -- we were rate limited and backed off. Fewer calls, or
+                       spread them over more IPs (--proxy).
+          overhead  -- time in neither: the event loop was starved. More
+                       concurrency makes this *worse*, not better.
+
+        The transport has recorded all three per endpoint since it was
+        written; nothing ever printed them.
+        """
+        transport = getattr(self.host, "_shared", None)
+        stats = getattr(transport, "stats", None)
+        endpoints = dict(getattr(stats, "endpoints", {}) or {})
+        if not endpoints:
+            OUT.say("    nothing recorded yet -- run a command first")
+            return
+        OUT.say("")
+        OUT.say(f"  {'endpoint':<38} {'calls':>6} {'429':>4} {'retry':>5}"
+                f" {'rt med':>7} {'rt max':>7} {'wait':>8} {'overhead':>9}")
+        for name, entry in sorted(endpoints.items()):
+            row = entry.summary()
+            OUT.say(
+                f"  {name[:38]:<38} {row['calls']:>6} "
+                f"{row['rate_limited']:>4} {row['retries']:>5} "
+                f"{row['roundtrip_median_ms']:>6.0f}ms "
+                f"{row['roundtrip_max_ms']:>6.0f}ms "
+                f"{row['wait_ms'] / 1000:>7.1f}s "
+                f"{row['overhead_ms'] / 1000:>8.1f}s"
+            )
+        OUT.say("")
+
     def show_servers(self, raw: str) -> None:
         if not INDEX.communities:
             OUT.say("    nothing indexed yet -- ,refresh")
@@ -1764,6 +2242,7 @@ LOCAL: dict[str, Callable] = {
     "accounts": Session.show_accounts,
     "who": Session.show_accounts,
     "servers": Session.show_servers,
+    "stats": Session.show_stats,
     "channels": Session.show_channels,
     "only": Session.set_only,
     "all": Session.set_all,
@@ -1777,6 +2256,7 @@ LOCAL_HELP = (
     (",help [command]", "this, or detail on one command"),
     (",accounts", "which accounts are up and which are selected"),
     (",servers", "indexed communities"),
+    (",stats", "where the time went: roundtrip vs rate-limit vs overhead"),
     (",channels <community>", "indexed channels in one community"),
     (",only <account>...", "run later commands as just these accounts"),
     (",all", "run later commands as every account"),
@@ -1969,8 +2449,9 @@ async def main(argv=None) -> int:
     parser.add_argument("--stagger", type=float, default=0.0, metavar="SECONDS",
                         help="fixed gap between logins (default 0; prefer "
                              "--login-concurrency)")
-    parser.add_argument("--login-concurrency", type=int, default=24, metavar="N",
-                        help="how many accounts log in at once (default 24; "
+    parser.add_argument("--login-concurrency", type=int, default=64,
+                        metavar="N",
+                        help="how many accounts log in at once (default 64; "
                              "0 for no limit)")
     parser.add_argument("--concurrency", type=int, default=64, metavar="N",
                         help="how many accounts act on a command at once "
@@ -2009,16 +2490,28 @@ async def main(argv=None) -> int:
         stagger=args.stagger,
         proxy=args.proxy,
         max_concurrent_logins=args.login_concurrency or None,
-        # The pool has to be able to hold what the gate lets through. HTTP/2
-        # multiplexes, so this is headroom rather than one socket per call.
-        max_connections=max(20, (args.login_concurrency or 32) * 2),
+        # The pool has to be able to hold what the gate lets through *and*
+        # what a command fans out to -- it used to be sized from the login
+        # gate alone, which left it smaller than --concurrency. HTTP/2
+        # multiplexes, so this is headroom rather than one socket per call:
+        # measured, 48 and 200 give the same throughput on one account.
+        max_connections=max(
+            20, (args.login_concurrency or 32) * 2, args.concurrency
+        ),
     )
     if args.proxy:
         print(f"routing through {args.proxy}")
     for label, token in accounts:
-        # gateway=False: this sends, it never listens. The websocket
-        # handshake is the slowest part of bringing an account up.
-        host.add(label, token, gateway=False)
+        # gateway=False: this sends, it never listens, and the websocket
+        # handshake is the slowest part of bringing an account up. The one
+        # thing that does need a socket -- holding a place in a member list --
+        # opens its own, for the accounts it is asked about, when it is asked.
+        # See ,attach and hold_socket.
+        # defer_hub: login is two sequential hops, and the first of them --
+        # GetNewHubserverEndpoint, ~680ms -- exists only to address a
+        # websocket. Most accounts here never open one, and ,attach fetches
+        # it for the ones that do.
+        host.add(label, token, gateway=False, defer_hub=True)
 
     # The try starts HERE, not after login. Everything below can raise -- a
     # network error in start(), a timeout in wait_ready(), Ctrl+C while the
@@ -2052,6 +2545,9 @@ async def main(argv=None) -> int:
               + "  (,accounts to see, ,only to narrow)")
 
         session = Session(host, concurrency=args.concurrency)
+        # Idle until something is actually held: the loop skips any account
+        # with an empty set, so a run that never attaches never pays for it.
+        KEEPER.start(host)
         if not args.no_index:
             INDEX.building = True
             # refresh=False: login already fetched each account's community
@@ -2066,6 +2562,7 @@ async def main(argv=None) -> int:
         if session is not None and session.running:
             print(f"\nwaiting for {len(session.running)} command(s)...")
             await asyncio.gather(*session.running, return_exceptions=True)
+        await KEEPER.stop()
         await host.stop()
     return 0
 

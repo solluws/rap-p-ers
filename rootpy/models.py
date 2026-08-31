@@ -823,6 +823,42 @@ class CommunityExtended:
         """Only the channels that hold messages."""
         return tuple(c for c in self.channels if getattr(c, "is_text", False))
 
+    @property
+    def attached_user_ids(self) -> tuple:
+        """The users the server currently reports as attached.
+
+        This is the only way to see whether an attach worked. The attach
+        request returns nothing, and a lost attach is silent: the account
+        stays logged in and leaves the member list. Until now a caller had to
+        decode field 20 of the raw response to find this out.
+
+        The client shows these users as present in the community. See
+        :meth:`rootpy.object_api.CommunityManager.held` to keep a place here.
+        """
+        from .protocol import decode_root_guid_message, iter_fields
+
+        found = []
+        for number, wire_type, value in iter_fields(self.raw):
+            if number != 20 or wire_type != 2:
+                continue
+            try:
+                decoded = decode_root_guid_message(value)
+            except Exception:                                 # noqa: BLE001
+                continue
+            if decoded:
+                found.append(decoded)
+        return tuple(found)
+
+    def is_attached(self, user_id: str) -> bool:
+        """Is this user attached to the community now?"""
+        from .identifiers import normalize_root_guid
+
+        target = normalize_root_guid(user_id)
+        return any(
+            normalize_root_guid(found) == target
+            for found in self.attached_user_ids
+        )
+
     def member(self, user_id: str):
         """Find one member by user id, or None."""
         for entry in self.members:

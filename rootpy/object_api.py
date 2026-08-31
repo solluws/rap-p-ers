@@ -176,6 +176,52 @@ class CommunityManager:
         """Detach from several communities in a single request."""
         await self.client.community_service.detach_many(community_ids)
 
+    # -- keeping an attach alive ---------------------------------------- #
+
+    def _attach_hold(self) -> "AttachHold":
+        """The one :class:`~rootpy.attach.AttachHold` for this client."""
+        from .attach import AttachHold
+
+        hold = getattr(self.client, "_attach_hold_instance", None)
+        if hold is None:
+            hold = AttachHold(self.client)
+            self.client._attach_hold_instance = hold
+        return hold
+
+    def held(self, community_id: str, *more: str) -> "_HeldCommunities":
+        """Attach, and *stay* attached, for as long as you hold this.
+
+            async with client.community.held(community_id):
+                ...          # packets arrive; you show up in the sidebar
+
+        :meth:`attach` on its own does not survive: the subscription lives
+        with the hub connection, and this hub closes each batch and expects a
+        fresh socket. An attach made once is gone inside a minute, with
+        nothing raised -- measured gone by +31s with no gateway, by +48s when
+        the socket was killed under it. This re-sends it every time the socket
+        comes back, and opens one if there isn't one.
+
+        Leaving the block detaches. Await it instead of entering it to hold
+        indefinitely, and call ``client.community.release(...)`` to stop.
+        """
+        from .attach import _HeldCommunities
+
+        return _HeldCommunities(self, (community_id, *more))
+
+    async def hold(self, community_id: str) -> "AttachHold":
+        """Attach and keep it attached, with no block to leave.
+
+        The half of :meth:`held` that does not undo itself -- for a bot that
+        attaches at startup and stays that way. Pair it with :meth:`release`.
+        """
+        hold = self._attach_hold()
+        await hold.add(community_id)
+        return hold
+
+    async def release(self, community_id: str) -> None:
+        """Stop holding a community, and detach from it."""
+        await self._attach_hold().remove(community_id)
+
     async def get_channel_groups(
         self,
         community_id: str,

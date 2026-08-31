@@ -44,6 +44,7 @@ import asyncio
 import pytest
 import pytest_asyncio
 
+from rootpy.enums import UserOnlineStatus
 from rootpy.models import build_user_mention
 from rootpy.responses import field as _field, items as _items
 
@@ -458,6 +459,29 @@ class TestCommunityMembershipEvents:
 
 
 class TestPresence:
+    """Presence is ``min(ceiling, device)``, and only two accounts show it.
+
+    One account cannot prove any of this. It can set a status and read the
+    same status back, which shows that the write succeeded. It does not show
+    that another person sees anything, and that is the part that failed:
+    ``set_online_status`` set the ceiling only, so an account that never
+    announced a device stayed invisible while both requests returned success.
+
+    Every test here puts the peer's ceiling back the way it found it.
+    """
+
+    @pytest_asyncio.fixture
+    async def restored_ceiling(self, peer):
+        """Give back the peer's ceiling, whatever the test does to it."""
+        identity = await peer.whoami(refresh=True)
+        original = int(getattr(identity, "max_online_status", 0) or 0)
+        yield original
+        if original:
+            await peer.users.set_online_status(original)
+            await peer.user_settings.set_device_online_status(
+                int(UserOnlineStatus.ACTIVE)
+            )
+
     async def test_peer_status_change_is_visible_to_itself(self, peer):
         await peer.update_status(f"probe {tag()}")
         try:
@@ -465,6 +489,120 @@ class TestPresence:
             assert refreshed is not None
         finally:
             await peer.update_status(None)
+
+    async def test_set_presence_is_visible_to_the_other_account(
+        self, client, peer, peer_identity, restored_ceiling
+    ):
+        """The half one account can never prove.
+
+        The device goes down first, and that is the point. ``peer`` is
+        connected, so its device is already Active, and a ceiling-only
+        implementation would pass this test without announcing anything. With
+        the device down, only a call that sets **both** halves can make the
+        other account see this one.
+        """
+        for name, expected in (
+            ("idle", UserOnlineStatus.INACTIVE),
+            ("online", UserOnlineStatus.ACTIVE),
+        ):
+            await peer.user_settings.set_device_online_status(
+                int(UserOnlineStatus.DISCONNECTED)
+            )
+            await peer.set_presence(name)
+            assert peer.presence is expected
+
+            async def seen():
+                profiles = await client.get_profiles([peer_identity.id])
+                profile = profiles.get(peer_identity.id)
+                status = int(getattr(profile, "online_status", 0) or 0)
+                return status == int(expected)
+
+            assert await eventually(seen, timeout=DELIVERY_TIMEOUT), (
+                f"the other account never saw {name} ({expected.name})"
+            )
+
+    async def test_the_ceiling_alone_leaves_the_account_invisible(
+        self, client, peer, peer_identity, restored_ceiling
+    ):
+        """The exact fault this API exists to stop.
+
+        Set the ceiling to Active, announce no device, and Root shows the
+        account as offline to everybody. Both requests return success, so
+        nothing tells the caller. ``set_presence`` sets both halves, which is
+        the difference proved by the test above.
+        """
+        await peer.user_settings.set_device_online_status(
+            int(UserOnlineStatus.DISCONNECTED)
+        )
+        await peer.users.set_online_status(int(UserOnlineStatus.ACTIVE))
+
+        async def offline_to_the_other_account():
+            profiles = await client.get_profiles([peer_identity.id])
+            profile = profiles.get(peer_identity.id)
+            status = int(getattr(profile, "online_status", 0) or 0)
+            return status != int(UserOnlineStatus.ACTIVE)
+
+        assert await eventually(
+            offline_to_the_other_account, timeout=DELIVERY_TIMEOUT
+        ), "a maximal ceiling with no device must not read as Active"
+
+    async def test_watch_presence_reports_a_change(
+        self, client, peer, peer_identity, restored_ceiling
+    ):
+        seen = []
+
+        async def note(user_id, status):
+            seen.append((user_id, status))
+
+        watch = client.watch_presence(
+            note, users=[peer_identity.id], poll=2.0
+        )
+        try:
+            await peer.set_presence("idle")
+            assert await eventually(
+                lambda: any(
+                    status is UserOnlineStatus.INACTIVE for _u, status in seen
+                ),
+                timeout=DELIVERY_TIMEOUT,
+            ), f"watch_presence saw {seen}"
+        finally:
+            await watch.stop()
+
+
+class TestAttachLifetime:
+    """``attach`` is silent, and so is losing it.
+
+    The request returns nothing at all, so the only proof is the other
+    account reading ``AttachedUserIds`` back off the community.
+    """
+
+    async def test_held_attaches_and_leaving_detaches(
+        self, client, peer, sandbox, joined_peer, peer_identity
+    ):
+        async def peer_is_attached():
+            extended = await client.fetch_community(sandbox.community_id)
+            return extended.is_attached(peer_identity.id)
+
+        async def peer_is_not_attached():
+            return not await peer_is_attached()
+
+        async with peer.community.held(sandbox.community_id):
+            assert await eventually(
+                peer_is_attached, timeout=DELIVERY_TIMEOUT
+            ), "held() did not put the account in AttachedUserIds"
+
+        assert await eventually(
+            peer_is_not_attached, timeout=DELIVERY_TIMEOUT
+        ), "leaving the block did not detach"
+
+    async def test_attached_user_ids_reads_the_raw_response(
+        self, client, sandbox, peer_identity
+    ):
+        """The accessor must answer even when nobody is attached."""
+        extended = await client.fetch_community(sandbox.community_id)
+        assert isinstance(extended.attached_user_ids, tuple)
+        assert all(isinstance(i, str) for i in extended.attached_user_ids)
+        assert extended.is_attached(peer_identity.id) in (True, False)
 
 
 def _content(event) -> str | None:

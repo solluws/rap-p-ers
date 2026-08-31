@@ -300,30 +300,215 @@ def test_wait_for_does_not_leak_waiters():
 
 
 # --- presence ------------------------------------------------------------- #
+class _PresenceResponse:
+    content = b""
+    status_code = 200
+    headers: dict = {}
+
+
+async def _presence_calls(action):
+    """Run ``action(client)`` and return every endpoint it sent."""
+    client = RootClient()
+    client.users._token_getter = lambda: "token"
+    calls = []
+
+    async def fake_unary(**kwargs):
+        calls.append((kwargs["endpoint"], kwargs.get("body")))
+        return _PresenceResponse()
+
+    client.users.transport.unary = fake_unary
+    result = await action(client)
+    await client.close()
+    return result, calls
+
+
 def test_presence_sends_correct_status_value():
+    result, calls = asyncio.run(_presence_calls(lambda c: c.go_idle()))
+    ceiling = next(
+        (endpoint, body) for endpoint, body in calls
+        if endpoint.endswith("SetMaxOnlineStatus")
+    )
+    fields = {n: v for n, _w, v in iter_fields(ceiling[1])}
+    assert result is UserOnlineStatus.INACTIVE
+    assert fields[10] == 4
+
+
+def test_presence_also_announces_the_device():
+    """Setting the ceiling alone leaves the account invisible.
+
+    Root shows ``min(ceiling, device)``, so an account whose ceiling is
+    Active and which never announced a device is offline to everyone -- and
+    both requests succeed while that happens. This test exists because that
+    is not a hypothetical: ``set_online_status`` used to send the ceiling
+    only, and a fan-out that called it appeared, correctly and silently, to
+    do nothing at all.
+    """
+    _result, calls = asyncio.run(_presence_calls(lambda c: c.go_idle()))
+    endpoints = [endpoint for endpoint, _body in calls]
+    assert any(e.endswith("SetMaxOnlineStatus") for e in endpoints), endpoints
+    assert any(e.endswith("SetDeviceOnlineStatus") for e in endpoints), endpoints
+
+
+def test_presence_property_applies_the_minimum():
+    """``client.presence`` is the rule written down, not the ceiling."""
+    from rootpy.presence import effective_presence
+
+    assert effective_presence(
+        UserOnlineStatus.ACTIVE, UserOnlineStatus.INACTIVE
+    ) is UserOnlineStatus.INACTIVE
+    # The trap: a maximal ceiling with nothing announced is still invisible.
+    assert effective_presence(
+        UserOnlineStatus.ACTIVE, 0
+    ) is UserOnlineStatus.DISCONNECTED
+    assert effective_presence(0, 0) is UserOnlineStatus.UNSPECIFIED
+
+
+def test_presence_reports_the_failure_instead_of_lying():
+    """A ceiling that lands with no device must not return success.
+
+    Returning the ceiling here would report exactly the state the caller
+    asked for while the account stayed invisible, which is the failure this
+    whole API exists to make impossible.
+    """
     async def run():
         client = RootClient()
         client.users._token_getter = lambda: "token"
-        captured = {}
-
-        class _Response:
-            content = b""
 
         async def fake_unary(**kwargs):
-            captured["body"] = kwargs["body"]
-            captured["endpoint"] = kwargs["endpoint"]
-            return _Response()
+            if kwargs["endpoint"].endswith("SetMaxOnlineStatus"):
+                return _PresenceResponse()
+            raise RuntimeError("device announcement refused")
 
         client.users.transport.unary = fake_unary
-        result = await client.go_idle()
-        fields = {n: v for n, _w, v in iter_fields(captured["body"])}
-        await client.close()
-        return result, fields, captured["endpoint"]
+        try:
+            await client.set_presence("online")
+            return None
+        except RuntimeError as exc:
+            return str(exc)
+        finally:
+            await client.close()
 
-    result, fields, endpoint = asyncio.run(run())
-    assert result is UserOnlineStatus.INACTIVE
-    assert fields[10] == 4
-    assert endpoint.endswith("SetMaxOnlineStatus")
+    message = asyncio.run(run())
+    assert message is not None
+    assert "not visible" in message
+
+
+# --- attach lifetime ------------------------------------------------------ #
+class _FakeCommunityService:
+    def __init__(self) -> None:
+        self.attached: list = []
+        self.detached: list = []
+
+    async def attach(self, community_id):
+        self.attached.append(community_id)
+
+    async def detach(self, community_id):
+        self.detached.append(community_id)
+
+    async def detach_many(self, community_ids):
+        self.detached.extend(community_ids)
+
+
+class _FakeAttachClient:
+    def __init__(self) -> None:
+        self.community_service = _FakeCommunityService()
+        self.is_connected = True
+        self.connects = 0
+
+    async def connect(self):
+        self.connects += 1
+        self.is_connected = True
+
+
+COMMUNITY = "0030e86a-3e52-8a02-8bb1-e2b4ec6a4128"
+
+
+def test_attach_hold_reattaches_when_the_socket_comes_back():
+    """The guarantee: a lost socket is a lost attach, and this notices.
+
+    Without it the account keeps looking logged in, keeps its client state,
+    and quietly stops being in the community -- measured gone by +48s when
+    the socket was killed under it.
+    """
+    from rootpy import AttachHold
+
+    async def run():
+        client = _FakeAttachClient()
+        hold = AttachHold(client, poll=0.05)
+        await hold.add(COMMUNITY)
+        after_first = len(client.community_service.attached)
+        client.is_connected = False              # the socket drops
+        await asyncio.sleep(0.3)
+        await hold.stop()
+        return after_first, client.community_service.attached, client.connects
+
+    after_first, attached, connects = asyncio.run(run())
+    assert after_first == 1, "add() should attach once, immediately"
+    assert len(attached) >= 2, "a dropped socket must be re-attached"
+    assert connects >= 1, "and the socket itself must be brought back"
+
+
+def test_attach_hold_context_manager_detaches_on_exit():
+    from rootpy import AttachHold
+
+    async def run():
+        client = _FakeAttachClient()
+        hold = AttachHold(client, poll=0.05)
+        await hold.add(COMMUNITY)
+        await hold.remove(COMMUNITY)
+        return client.community_service.detached, hold.running
+
+    detached, still_running = asyncio.run(run())
+    assert detached == [COMMUNITY]
+    assert not still_running, "the last release should stop the watcher"
+
+
+# --- broadcast concurrency -------------------------------------------------- #
+def test_broadcast_concurrency_scales_with_the_host():
+    """One flat default cannot be right for 5 accounts and for 1,300.
+
+    8 was the old default. It is correct for a small host and costs 28 s per
+    command at 1,089 accounts, and the only warning was a docstring.
+    """
+    from rootpy.host import (
+        DEFAULT_MAX_CONCURRENCY,
+        DEFAULT_MIN_CONCURRENCY,
+        resolve_concurrency,
+    )
+
+    # A small host keeps the old behaviour: more permits than accounts.
+    assert resolve_concurrency(None, 1) == DEFAULT_MIN_CONCURRENCY
+    assert resolve_concurrency(None, 8) == DEFAULT_MIN_CONCURRENCY
+    # A large host stops queueing behind a gate of 8.
+    assert resolve_concurrency(None, 50) == 50
+    assert resolve_concurrency(None, 1307) == DEFAULT_MAX_CONCURRENCY
+    # An explicit number always wins, including a small one.
+    assert resolve_concurrency(16, 1307) == 16
+    assert resolve_concurrency(1, 1307) == 1
+
+
+# --- retry classification -------------------------------------------------- #
+def test_unavailable_can_be_made_non_retryable():
+    """Root answers a non-member's message send with 14, not PERMISSION_DENIED.
+
+    Retrying it cannot ever help -- measured as the same 7 of 24 accounts
+    failing at concurrency 8 and at 64, each having burned two retries and
+    two backoffs first.
+    """
+    from rootpy.transport import GrpcWebTransport
+
+    default = GrpcWebTransport()
+    assert default._is_retryable("any", "14", 1)
+
+    narrowed = GrpcWebTransport(retry_statuses={"4", "8", "10", "13"})
+    assert not narrowed._is_retryable("any", "14", 1)
+    assert narrowed._is_retryable("any", "8", 1)
+
+    hooked = GrpcWebTransport(
+        should_retry=lambda endpoint, status, attempt: "Message" not in endpoint
+    )
+    assert not hooked._is_retryable("root.v2.MessageGrpcService/Create", "14", 1)
+    assert hooked._is_retryable("root.UserGrpcService/GetSelf", "14", 1)
 
 
 def test_online_status_enum_has_active():
