@@ -19,6 +19,7 @@ client = RootClient(
     preload_caches=True,           # load identity + community list at login
     expand_communities=False,      # fetch every community's detail at login
     preload_direct_messages=False,
+    defer_hub=False,               # skip the hub lookup at login; connect() does it
     contention_pause=0.0,          # stand off on repeated 4016 closes
     contention_threshold=3,
 )
@@ -73,7 +74,7 @@ manager.
 | method | notes |
 |---|---|
 | `login_token(token=None)` | authenticate; no websocket |
-| `connect()` | open the gateway; returns once up |
+| `connect(announce_device=True)` | open the gateway; returns once up. Also announces this device Active, which is half of presence — pass `False` to announce it yourself |
 | `start_token(token=None)` | login + connect + **blocks forever** |
 | `close()` | shut down cleanly |
 | `whoami()` | current user |
@@ -133,6 +134,9 @@ role.edit(**kwargs)                role.delete()   role.move(...)
 | `get_random_member(community, with_profile=True, exclude_self=True)` | one at random with username/pictures, or None |
 | `get_random_members(community, count, with_profile=True)` | `count` distinct with profiles (batched), capped at available |
 | `extended.channels` · `.text_channels` · `.member(id)` · `.role(id)` | on CommunityExtended |
+| `extended.attached_user_ids` · `.is_attached(id)` | who the server shows attached right now |
+| `community.attach(id)` · `.detach(id)` · `.detach_many(ids)` | turn a community's packets on and off — **an attach decays**, see below |
+| `community.held(id)` (`async with`) · `.hold(id)` · `.release(id)` | keep an attach alive across reconnects |
 | `invites.join(code)` · `leave_community(id)` | |
 | `community_admin.create_channel(community, group, name, channel_type=1)` | |
 | `community_admin.create_role(community, name, ...)` | |
@@ -164,7 +168,7 @@ batch that fails is logged and skipped; those members come back with
 profile.username           profile.about_me          # == .description
 profile.avatar_url         # == .profile_picture_uri
 profile.banner_uri         profile.custom_status
-profile.online_status      profile.is_deleted
+profile.online_status      profile.is_deleted   # online_status is min(ceiling, device)
 
 # DetailedMember exposes all of the above directly, plus:
 member.user_id             member.role_ids
@@ -184,7 +188,11 @@ await member.add_role(id)  await member.kick()
 
 | method | notes |
 |---|---|
-| `go_online()` · `go_idle()` · `go_invisible()` · `set_online_status(s)` | presence |
+| `set_presence(s)` | sets **both** halves of presence; raises if the ceiling lands and the device does not |
+| `set_online_status(s)` | alias for `set_presence` |
+| `go_online()` · `go_idle()` · `go_invisible()` | shorthand for `set_presence(...)` |
+| `presence` | property: what this client last made others see |
+| `watch_presence(on_change, users=None, poll=None)` | others' presence: push (needs an attach) and/or poll (needs neither) |
 | `update_status(text)` | custom status; `None` clears |
 | `change_profile_picture(source)` · `remove_profile_picture()` | path / Path / bytes / file object / URL / None |
 | `change_banner(source)` | same source types |
@@ -197,6 +205,14 @@ await member.add_role(id)  await member.kick()
 
 Asset links are **short-lived** (`asset.expires_at`) — store bytes, not URLs,
 if you need something to last.
+
+Presence has two independent halves, and Root shows others the lower one:
+`min(ceiling, device)`. The ceiling is `SetMaxOnlineStatus`
+(`client.users.set_online_status`); the device is `SetDeviceOnlineStatus`
+(`client.user_settings.set_device_online_status`). Both succeed on their own,
+so a ceiling with no device announcement is invisible to everybody and reports
+success. `set_presence` sets both. `rootpy.presence.effective_presence` is the
+rule on its own.
 
 ### Events
 
@@ -290,6 +306,12 @@ cooldown table is keyed per account, so a `429` on one does not stall the
 others). `broadcast` fans an action out concurrently and returns one `Outcome`
 each; `only=`, `concurrency=`, `timeout=` bound it. `host.status()` snapshots
 every account; `shared_transport=False` isolates their connection pools.
+
+`concurrency=None` (the default) scales with the number of accounts and caps
+at 64. It was a flat 8, which costs 28 s a command at 1,089 accounts; a host of
+8 accounts or fewer is unchanged. `MEASURED_CEILINGS` records what one IP gets:
+~120/s plain calls, ~60/s login, ~87/s attach, ~17/s websocket handshakes. Size
+socket work from the last number, not the first.
 
 `max_connections` (default 20) caps whichever **HTTP** pool the accounts use —
 the *whole host's* when the transport is shared, *each account's* when it is

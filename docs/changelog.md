@@ -1,5 +1,92 @@
 # Changelog
 
+## 1.30.0
+
+Two faults that a single account can never see, and a fan-out that got about
+ten times faster. Both faults had the same shape: the call returned success
+and the thing the caller asked for did not happen, so nothing anywhere raised.
+
+1913 offline tests, 352 live (225 `live`, 127 `live2`), and 216/240 service
+methods reached by the live suite — 90%, or 206/240 (86%) under
+`covermap.py --strict`. Six of the new live tests are two-account tests,
+because neither fault below is visible from one account.
+
+### Presence is `min(ceiling, device)`
+
+Root computes what other people see from two independent values, and the lower
+one wins. The ceiling is `UserGrpcService/SetMaxOnlineStatus`; the device is
+`UserGrpcService/SetDeviceOnlineStatus`, which the desktop client announces on
+every connect.
+
+`set_online_status` sent the ceiling only. An account that never announced a
+device was **invisible to everybody** while both requests returned success —
+so a fan-out that called it appeared, correctly and silently, to do nothing.
+
+`client.set_presence(status)` sets both halves, and `set_online_status` is now
+an alias for it, so `go_online`, `go_idle` and `go_invisible` are fixed too. It
+**raises** if the ceiling lands and the device does not: returning the ceiling
+there would report the state the caller asked for while the account stayed
+invisible, which is the whole fault repeated one layer up.
+
+New `client.presence` reports the effective value. New
+`client.watch_presence(on_change, users=..., poll=...)` covers both ways to
+observe someone else: push, which needs an attach, and polling, which needs
+neither an attach nor a socket. New module `rootpy/presence.py` holds the rule
+as `effective_presence()`.
+
+### An attach does not outlive the connection
+
+The subscription lives with the hub connection, not the account, and this hub
+closes each batch and expects a new socket. So an attach made once decays on
+its own. Measured against a second account reading `AttachedUserIds`: still
+there at +16 s with no gateway and gone by +31 s; survived +36 s when the
+socket was killed under it and gone by +48 s. Nothing is raised — the account
+keeps looking logged in and leaves the member list.
+
+New module `rootpy/attach.py` with `AttachHold`, reached through
+`async with client.community.held(id):`, or `client.community.hold(id)` and
+`.release(id)` for a bot with no block to leave. It re-sends the attach every
+time the socket comes back, and opens a socket if there is not one.
+
+`CommunityExtended.attached_user_ids` and `.is_attached(user_id)` are new, and
+are the only way to confirm an attach took hold. That used to mean decoding
+field 20 of the raw response by hand.
+
+### Retries, and a counter that read zero
+
+Root answers a non-member's message send with **14 (UNAVAILABLE)**, not
+PERMISSION_DENIED, so the transport retried a permanent failure twice — the
+same 7 of 24 accounts failed identically at concurrency 8 and at 64.
+`GrpcWebTransport` now takes `retry_statuses` and a
+`should_retry(endpoint, status, attempt)` hook.
+
+`RESOURCE_EXHAUSTED` (8) now counts as rate limiting. It never sets HTTP 429,
+so `stats.rate_limited` read 0 while calls were plainly being throttled —
+which is the one number you reach for when a fan-out slows down.
+
+### Fan-out speed
+
+Measured across 1,307 accounts on one shared transport:
+
+| phase | before | after |
+|---|---|---|
+| login | ~110 s | 19.6 s |
+| presence | 348.8 s | 20.8 s |
+| attach | 335.3 s | 32.6 s |
+| detach | 166.7 s | 13.5 s |
+
+`RootClient(defer_hub=True)` takes the hub lookup off the login path and does
+it in `connect()`, when something actually wants a socket: 38.7/s → 60.9/s.
+`connect(announce_device=False)` lets a caller announce the device itself.
+
+`MultiClientHost.broadcast(concurrency=...)` no longer defaults to a flat 8,
+which costs 28 s a command at 1,089 accounts. It scales with the account count
+and caps at 64; a host of 8 accounts or fewer is unchanged. New
+`MEASURED_CEILINGS` records what one IP gets — ~120/s for plain calls, ~60/s
+for login, ~87/s for attach, and only ~17/s for websocket handshakes. They are
+not interchangeable, and treating them as one number is what made a
+1,307-account attach take 335 s.
+
 ## 1.29.0
 
 A correctness pass against client **0.9.128**. Almost nothing here was

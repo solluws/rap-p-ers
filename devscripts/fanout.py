@@ -1913,9 +1913,12 @@ KEEPER = AttachKeeper()
 class Session:
     def __init__(self, host: MultiClientHost, *, concurrency: int = 64) -> None:
         self.host = host
-        # broadcast() defaults to 8, which is fine for a handful of accounts
-        # and badly wrong for a lot of them: at 1,089 accounts and a 200ms
-        # round trip that is 28 seconds for every single command. Measured
+        # broadcast() used to default to a flat 8, which is fine for a handful
+        # of accounts and badly wrong for a lot of them: at 1,089 accounts and
+        # a 200ms round trip that is 28 seconds for every single command. It
+        # now scales with the account count and caps at 64 -- these numbers
+        # are why -- but this fan-out still passes its own value, because
+        # --concurrency is a knob the operator is meant to turn. Measured
         # against the real broadcast with a simulated round trip:
         #   concurrency=8 -> 28.3s   32 -> 7.3s   64 -> 3.8s   128 -> 2.0s
         # Root's rate limits are per account and these are all different

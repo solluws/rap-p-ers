@@ -9,7 +9,7 @@ characteristics, the protocol traps that are impossible to guess — and a
 complete listing of every service, class and function with real signatures
 (§14).
 
-**Version 1.29.0** — 1880 offline tests, 347 live tests, 214/237 service
+**Version 1.30.0** — 1913 offline tests, 352 live tests, 216/240 service
 methods (90%) exercised against the real API. Sections 17–21 are the technical
 handoff: the protocol traps with their evidence, measured coverage and
 performance, the open threads, and the mistakes worth not repeating.

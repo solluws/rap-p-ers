@@ -144,14 +144,18 @@ async def profile(client: RootClient, state: dict) -> None:
         detail(f"status   : {full.custom_status or '(none)'}")
 
     step("presence: idle -> invisible -> online")
+    detail("others see min(ceiling, device) -- set_presence() sets both halves")
     for label, call in (
         ("idle", client.go_idle),
         ("invisible", client.go_invisible),
         ("online", client.go_online),
     ):
         await call()
-        detail(f"now {label}")
+        detail(f"now {label}; client.presence reads back {client.presence.name}")
         await asyncio.sleep(0.4)
+    detail("client.users.set_online_status() sets the ceiling ALONE -- an "
+           "account that never announced a device stays invisible to "
+           "everybody while that call reports success")
 
     step("custom status")
     await client.update_status("touring rootpy")
@@ -438,12 +442,19 @@ async def events(client: RootClient, state: dict) -> None:
         detail(name)
     detail("add_listener(name, fn) registers extra handlers for one event")
 
-    step("community.attach() -- what makes channel messages push at all")
+    step("community.hold() -- what makes channel messages push, and keeps it")
     community_id = state.get("community_id")
     if community_id:
-        await client.community.attach(community_id)
-        detail("attached; channel posts now arrive as on_message in ~0.2s")
-        detail("await client.community.detach(id) to stop and leave presence")
+        await client.community.hold(community_id)
+        detail("attached and held; channel posts now arrive as on_message "
+               "in ~0.2s")
+        detail("a bare community.attach() would decay on its own -- the "
+               "subscription lives with the hub connection, and this hub "
+               "closes each batch. Measured gone by +31s with no gateway, "
+               "+48s when the socket was killed under it, nothing raised")
+        detail("hold() re-attaches every time the socket comes back; "
+               "release(id) stops. 'async with client.community.held(id)' "
+               "is the same thing scoped to a block")
     detail("UnreadReader(client) does this for every community and reads "
            "what arrives -- see examples/ and the README")
 
@@ -466,6 +477,11 @@ async def events(client: RootClient, state: dict) -> None:
         detail(f"got: {event.message.content[:40]!r}")
     except asyncio.TimeoutError:
         detail("timed out -- nothing arrived (normal on a quiet account)")
+
+    if community_id:
+        step("community.release() -- stop holding, and detach")
+        await client.community.release(community_id)
+        detail("released")
 
     client.unwatch_all()
 

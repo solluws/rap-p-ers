@@ -239,11 +239,22 @@ the requested operation.
 Root rejected work because of a quota/resource/rate limit. Do not retry in a
 tight loop. Respect server retry metadata when available.
 
+Status 8 never sets HTTP 429, so it gets no per-endpoint cooldown. It does
+count in `client.timings()` under `rate_limited`, which used to read 0 while a
+gRPC-only throttle was plainly happening.
+
 ### `GrpcUnavailable` / status 14
 
 The service could not process the request at that time. This is generally a
 transient connectivity/service condition; use bounded backoff rather than an
-immediate retry loop.
+immediate retry loop. rootpy retries it for you.
+
+Root also uses status 14 for at least one **permanent** failure: posting to a
+channel you are not a member of comes back as UNAVAILABLE, not
+PERMISSION_DENIED. Retrying cannot help — measured as the same 7 of 24
+accounts failing at concurrency 8 and at 64, each after two retries and two
+backoffs. For a call you know fails this way, pass `retry_statuses=` (to drop
+14 from the retried set) or `should_retry=` to `GrpcWebTransport`.
 
 ## Gateway errors are events, not exceptions
 

@@ -125,6 +125,12 @@ rather than absolutes:
 **The websocket is optional.** Every RPC — sending, reading, admin, presence —
 works over plain HTTPS. You only need `connect()` to *receive* pushed events.
 
+**Bringing up many accounts:** `RootClient(defer_hub=True)` drops the hub
+endpoint lookup from login and fetches it inside `connect()` instead, when
+something actually wants a socket. Login goes from 3 hops to 2, measured
+~39/s to ~61/s across 1,307 accounts. Use it when you build many clients and
+some of them may never connect.
+
 ### Token-only — one request, no login
 
 `send()` needs nothing but the bearer token, so a fire-and-forget script can
@@ -163,6 +169,10 @@ client = RootClient(token=TOKEN)
 await client.login_token()
 await client.connect()          # returns once the socket is up
 ```
+
+`connect()` also announces this device as Active, which is one of the two
+halves of presence — see [Your account](#your-account). Pass
+`announce_device=False` to skip it and announce it yourself.
 
 > **Note:** `start_token()` is `login_token()` + `connect()` + *wait forever*.
 > It never returns by design. If you need control flow back, use the two calls
@@ -416,10 +426,13 @@ await client.unblock(user_id)
 ## Your account
 
 ```python
+await client.set_presence("online")          # or "idle" / "invisible"
 await client.go_online()
 await client.go_idle()
 await client.go_invisible()
-await client.set_online_status("online")     # or a UserOnlineStatus
+await client.set_online_status("online")     # alias for set_presence
+
+client.presence                              # what others see, min(ceiling, device)
 
 await client.update_status("working on something")
 await client.update_status(None)             # clear it
@@ -440,6 +453,41 @@ await client.change_banner("banner.png")                     # same source types
 
 > Root has no *do not disturb* state. Presence is active / inactive (idle) /
 > disconnected (appears offline).
+
+**Presence is two independent values, and the lower one wins.** What other
+people see is `min(ceiling, device)`:
+
+| half | call | means |
+|---|---|---|
+| ceiling | `SetMaxOnlineStatus` | the most you are willing to appear as |
+| device | `SetDeviceOnlineStatus` | what this connection says it is doing |
+
+Both calls succeed on their own, so a ceiling of Active with no device
+announcement leaves the account **offline to everybody** and reports success
+while it does. `set_presence` sets both halves, and raises if the ceiling
+lands but the device does not — so it cannot happen quietly. `connect()`
+announces the device too.
+
+For one half on its own, use `client.users.set_online_status(s)` (ceiling) or
+`client.user_settings.set_device_online_status(s)` (device).
+
+### Watching somebody else's presence
+
+```python
+watch = client.watch_presence(
+    lambda user_id, status: print(user_id, status),
+    users=[user_id],
+    poll=5,                    # seconds; omit for push only
+)
+...
+await watch.stop()
+```
+
+Two routes, with different requirements. **Push** is instant and free, but the
+hub only sends `USER_SET_STATUS` for communities this connection has attached
+— see [Protocol notes](#protocol-notes). **Poll** needs no attach and no
+socket, and reads every watched user in one request per tick. Push is always
+on; `poll=` adds the second route.
 
 ---
 
@@ -551,7 +599,8 @@ It is not a universal catch-all, though, and that snippet is a good place to see
 why. Where no typed class exists the library still raises a plain
 `RuntimeError`: `connect()` without a session, `wait_until_ready()` before
 connect, `user.kick(ctx)` with no active call — the very call above, outside a
-call — and the "server answered with something we can't parse" paths in
+call — `set_presence()` when the ceiling lands but the device announcement
+fails, and the "server answered with something we can't parse" paths in
 `auth.py` and the service modules. A transport failure that outlives
 `max_retries` is re-raised as the underlying `httpx` exception
 (`TimeoutException`, `NetworkError`, `RemoteProtocolError`) rather than wrapped.
@@ -566,13 +615,24 @@ raises what.
 Rate limits are handled for you: a `429` records a per-endpoint cooldown that
 *all* callers respect, rather than each retrying into the same wall.
 
+Root also throttles with gRPC status 8 (`RESOURCE_EXHAUSTED`), which never
+sets a `429`. That one gets no cooldown, but it now counts in
+`stats.rate_limited` — the figure used to read 0 while calls were plainly
+being throttled.
+
+Root returns gRPC status 14 (`UNAVAILABLE`) for some **permanent** failures,
+such as posting to a channel you are not a member of. The default retry set
+includes 14, because it is usually transient, so a call that can never
+succeed still pays two retries. Pass `retry_statuses=` or `should_retry=` to
+`GrpcWebTransport` for calls you know will not improve.
+
 ---
 
 ## Performance notes
 
 Measured against a live account. The most recent timing pass averaged **~190 ms**
 round trip over ~850 calls — 188–199 across three runs, 332 tests at the time of
-the measurement and 347 now. That supersedes the ~213 ms over 496 calls this
+the measurement and 352 now. That supersedes the ~213 ms over 496 calls this
 section used to quote, which is the earlier run; [LLMS.md §19](LLMS.md) carries
 both and says which is which. Read every total as of its own run — the live
 suite keeps growing — and note that the per-call figure moved too, so it is not
@@ -640,6 +700,16 @@ cost barely more wall time than one — measured at **1.10x** for a two-account
 fan-out against a single call, 190 ms vs 172 ms) and sequentially *within* each
 account; `only=`, `concurrency=` and `timeout=` bound it. `host.join(code)` is
 the named shorthand for the example above.
+
+`concurrency` defaults to `None`, which scales with the number of accounts and
+caps at 64. It used to be a flat 8, which costs 28 s a command at 1,089
+accounts; a host of 8 accounts or fewer is unchanged. Measured across 1,089
+accounts for one command: 8 → 28.3 s, 32 → 7.3 s, 64 → 3.8 s, 128 → 2.0 s.
+
+`rootpy.host.MEASURED_CEILINGS` records what one IP gets from Root, and the
+numbers are not interchangeable: ~120/s for plain calls, ~60/s for login (two
+gathered calls), ~87/s for attach, and only ~17/s for websocket handshakes.
+Size socket work from the last one, not the first.
 
 > **Which refusal you get is not what you would guess.** Root answers
 > `UNAUTHENTICATED (16)` both for an account that is *already a member* and for
@@ -712,7 +782,7 @@ rootpy/data/     five generated JSON registries, ~1.1 MB
 example.py       guided tour of the whole SDK
 examples/        two short focused examples
 devscripts/      testing, benchmarking, protocol diagnostics
-tests/           1880 offline tests, plus 347 live (see Testing)
+tests/           1913 offline tests, plus 352 live (see Testing)
 docs/            reference and protocol notes
 ```
 
@@ -755,6 +825,7 @@ and the protocol diagnostics:
 | `multihost.py` · `sendone.py` | many accounts in one process; single-request send |
 | `diagnose.py` · `signupdebug.py` · `assetdiag.py` | RPC troubleshooting |
 | `useraccounts.py` | scrape member profiles to CSV |
+| `fanout.py` | many accounts, one prompt: broadcast a command to all of them |
 
 And two short ones in [`examples/`](examples/):
 
@@ -848,7 +919,7 @@ field 10, wire type 2.
 
 ```bash
 pip install -e ".[dev]"
-pytest -q                      # 1880 offline: no token, no network
+pytest -q                      # 1913 offline: no token, no network
 ```
 
 Live tests need a real account. They create a community they own, work inside
@@ -860,15 +931,15 @@ export ROOT_TOKEN="..."
 pytest -m live -v              # 225 tests
 
 export ROOT_TOKEN2="..."       # a second account
-pytest -m live2 -v             # 122 more: DMs, calls, friend requests,
+pytest -m live2 -v             # 127 more: DMs, calls, friend requests,
                                # moderation, and the broadcast fan-out
-pytest -m "live or live2" -v   # 347
+pytest -m "live or live2" -v   # 352
 ```
 
-**214 of 237 service methods (90%) are exercised against the live API** —
+**216 of 240 service methods (90%) are exercised against the live API** —
 `devscripts/covermap.py` walks the call graph out of every live test and says
 so. `--strict` drops the edges it resolved by a colliding method name
-(`list`, `create`, `get`) rather than by service, and reports 205 (86%). Run
+(`list`, `create`, `get`) rather than by service, and reports 206 (86%). Run
 both: the truth is between them, and the gap is how much of the number is
 inference.
 [LLMS.md §18](LLMS.md) has the per-service breakdown and, more importantly,
@@ -914,8 +985,23 @@ Findings that aren't obvious from the API:
   `message` event in ~0.2 s. The desktop client does this when it fully loads a
   community and detaches on unload, which is why it only sees live traffic for
   communities it has opened. `UnreadReader` attaches for you.
+- **An attach does not outlive the connection.** The subscription lives with
+  the hub connection, not the account, and the hub closes each batch and
+  expects a new socket — so the attach goes with it. Measured against a second
+  account reading `AttachedUserIds`: gone by +31 s with no gateway at all, and
+  by +48 s when the socket was killed under it. Nothing is raised either way;
+  the account simply leaves the member list while it still looks logged in.
+  Use `async with client.community.held(id):`, or `client.community.hold(id)`
+  and `.release(id)` for a bot with no block to leave. Both re-send the attach
+  every time the socket comes back. `CommunityExtended.attached_user_ids` and
+  `.is_attached(user_id)` are the only way to confirm one took hold.
 - **Attaching is visible.** The server broadcasts `COMMUNITY_MEMBER_ATTACH`
   (5502) and clients show attached members as present in the community.
+- **Presence is two calls, and the lower one wins.** What others see is
+  `min(ceiling, device)` — the ceiling from `SetMaxOnlineStatus`, the device
+  from `SetDeviceOnlineStatus`. Both succeed on their own, so setting only the
+  ceiling leaves the account invisible to everybody and reports success.
+  `client.set_presence` sets both; see [Your account](#your-account).
 - **Mentions and DMs are pushed with no attach at all.** A notification embeds
   the whole originating message — content, author, and the author's display
   name.

@@ -59,6 +59,8 @@ method])` returns one as a dict, with both schemas already resolved into it.
 | `exceptions.py`, `root_exception.py` | the typed error tree and Root's structured error payloads |
 | `cache.py`, `discovery.py` | `StateCache`, and offline API discovery (`explain`/`preview`) |
 | `host.py` | `MultiClientHost` — many accounts, one loop, one process |
+| `presence.py` | `effective_presence()` — the `min(ceiling, device)` rule — and `PresenceWatch` |
+| `attach.py` | `AttachHold` — keeps an attach alive across the hub's reconnects |
 | `responses.py` | the one reader for "get field X off whatever shape this response is" |
 | `data/*.json` | the generated protocol registries, loaded lazily |
 
@@ -154,6 +156,21 @@ obvious:
   had to go through a DM — that was an artefact of measuring without the
   attach, and it is retracted. See [`../../LLMS.md`](../../LLMS.md) §17,
   "Membership is not a subscription — `Attach` is".
+- **A bare `attach()` does not survive.** The subscription lives with the hub
+  connection, not the account, and the resync cycle above takes it down with
+  the socket. An attach made once and never renewed was measured gone by +31 s
+  with no gateway at all, and by +48 s when the socket was killed under it —
+  nothing raised either way, the account simply drops out of the member list.
+  `async with client.community.held(community_id):` re-sends the attach every
+  time the socket comes back; `.hold()` / `.release()` do the same with no
+  block to leave. `CommunityExtended.attached_user_ids` and
+  `.is_attached(user_id)` are the only way to confirm one took hold — that
+  used to mean decoding field 20 of the raw response by hand.
+- **Presence is two calls, and the lower one wins.** Others see
+  `min(ceiling, device)`: the ceiling from `SetMaxOnlineStatus`, the device
+  from `SetDeviceOnlineStatus`. Both succeed independently, so setting only
+  the ceiling leaves the account invisible to everybody and returns success.
+  `client.set_presence` sets both and raises if the device half fails.
 - **A stale resume cursor is also reported in band.** `ClientNotification`
   field 1 is a `PacketErrorCode` (`UNSPECIFIED = 0`, `SYNC_LOST = 1`), and the
   server only writes it when it is non-zero, so it is absent from the
@@ -193,6 +210,16 @@ async with host:
   either the value or the exception, because partial success is the normal
   fan-out result. It is concurrent across accounts and sequential within one —
   measured at 1.10x a single call for a two-account fan-out.
+- **`concurrency=None` scales instead of defaulting to a flat 8.** 8 suits a
+  handful of accounts and is badly wrong for a lot of them: at 1,089 accounts
+  and a 200 ms round trip that is 28 s a command. It now scales with the
+  account count, capped at `DEFAULT_MAX_CONCURRENCY` (64) — measured 8 →
+  28.3 s, 32 → 7.3 s, 64 → 3.8 s, 128 → 2.0 s. `MEASURED_CEILINGS` records why
+  one knob cannot fit both kinds of work: ~120/s for plain calls, ~60/s for
+  login (two gathered calls), ~87/s for attach, but only ~17/s for websocket
+  handshakes. `RootClient(defer_hub=True)` takes the hub lookup off the login
+  path (~39/s → ~61/s), and `connect(announce_device=False)` lets the device
+  announcement be scheduled separately.
 
 `broadcast` is the *only* sanctioned fan-out, and an offline guard keeps
 mass-messaging helpers off the single-account surface.
