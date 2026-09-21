@@ -1,0 +1,94 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Build
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+
+      - name: The tag matches the version in pyproject.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          python - <<'PY'
+          import os, pathlib, tomllib
+          tag = os.environ["GITHUB_REF_NAME"]
+          data = tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))
+          version = data["project"]["version"]
+          assert tag == f"v{version}", f"tag {tag} does not match version {version}"
+          print("tag OK:", tag)
+          PY
+
+      - name: Metadata is valid for PyPI
+        run: python -m twine check --strict dist/*
+
+      - name: The distributions carry the protocol registries
+        run: |
+          python - <<'PY'
+          import glob, zipfile
+          names = zipfile.ZipFile(sorted(glob.glob("dist/*.whl"))[-1]).namelist()
+          data = [n for n in names if n.endswith(".json")]
+          assert len(data) == 5, f"expected 5 data files in the wheel, got {data}"
+          assert any(n.endswith("rootpy/py.typed") for n in names), "py.typed missing"
+          print("wheel OK:", data)
+          PY
+          python -m venv /tmp/v
+          /tmp/v/bin/pip install --quiet dist/*.tar.gz
+          /tmp/v/bin/python - <<'PY'
+          import sys
+          from importlib.metadata import version
+          from rootpy.structured_registry import MESSAGES
+          import rootpy
+
+          # A lower bound, not an equality: this gate exists to catch a
+          # distribution that shipped without its data files, and the
+          # registry grows every time Root does. The exact count is pinned
+          # in tests/test_untested_surface.py, which is where a change to
+          # it should have to be acknowledged.
+          assert len(MESSAGES) >= 842, f"registry is short: {len(MESSAGES)}"
+          assert "source" not in next(iter(MESSAGES.values())), \
+              "registry entries carry a stray 'source' key"
+          assert version("rootpy-client"), "installed distribution has no version"
+          assert "httpx" not in sys.modules, "httpx must stay off the import path"
+          print("sdist install OK")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    # Trusted publishing: PyPI mints a short-lived token from this workflow's
+    # OIDC identity. There is no API token stored anywhere, so there is none
+    # to leak. Configure it once on PyPI for project rootpy-client, owner
+    # solluws, repository rap-p-ers, workflow release.yml, environment pypi.
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1

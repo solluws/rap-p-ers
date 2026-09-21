@@ -1,0 +1,35 @@
+# Credentials. Never commit a token, in any file that might hold one.
+.env
+.env.*
+tokens*.txt
+token.txt
+*.token
+accounts*.json
+*.pem
+
+# Run output.
+log.txt
+diag.txt
+run.txt
+*.log
+timing*.json
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# editors
+.vscode/
+.idea/
+.DS_Store
+
+# Vendored binaries stay out of the repository.
+*.exe

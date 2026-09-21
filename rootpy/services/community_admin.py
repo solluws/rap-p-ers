@@ -1,0 +1,1036 @@
+from __future__ import annotations
+
+from dataclasses import replace
+from typing import Dict, Iterable, List, Optional, Tuple
+
+from ..enums import ChannelType
+from ..identifiers import (
+    create_command_idempotency_guid,
+    encode_root_guid,
+    encode_root_guid_parts,
+    normalize_root_guid,
+)
+from ..models import Channel, ChannelGroup, Community, CommunityRole
+from ..permissions import (
+    AccessRule,
+    ChannelOverlay,
+    ChannelPermissions,
+    CommunityPermission,
+)
+from ..protocol import (
+    bool_field,
+    decode_root_guid_message,
+    encode_varint,
+    field_key,
+    grpc_frame,
+    iter_fields,
+    iter_grpc_web_frames,
+    length_field,
+)
+from ..transport import GrpcWebTransport
+
+
+BASE = "https://api.rootapp.com"
+
+COMMUNITY_CREATE = f"{BASE}/root.CommunityGrpcService/Create"
+COMMUNITY_EDIT = f"{BASE}/root.CommunityGrpcService/Edit"
+COMMUNITY_DELETE = f"{BASE}/root.CommunityGrpcService/Delete"
+
+CHANNEL_GROUP_CREATE = f"{BASE}/root.ChannelGroupGrpcService/Create"
+CHANNEL_GROUP_EDIT = f"{BASE}/root.ChannelGroupGrpcService/Edit"
+CHANNEL_GROUP_MOVE = f"{BASE}/root.ChannelGroupGrpcService/Move"
+CHANNEL_GROUP_DELETE = f"{BASE}/root.ChannelGroupGrpcService/Delete"
+
+CHANNEL_CREATE = f"{BASE}/root.ChannelGrpcService/Create"
+CHANNEL_EDIT = f"{BASE}/root.ChannelGrpcService/Edit"
+CHANNEL_MOVE = f"{BASE}/root.ChannelGrpcService/Move"
+CHANNEL_DELETE = f"{BASE}/root.ChannelGrpcService/Delete"
+
+ROLE_CREATE = f"{BASE}/root.CommunityRoleGrpcService/Create"
+ROLE_EDIT = f"{BASE}/root.CommunityRoleGrpcService/Edit"
+ROLE_MOVE = f"{BASE}/root.CommunityRoleGrpcService/Move"
+ROLE_DELETE = f"{BASE}/root.CommunityRoleGrpcService/Delete"
+
+ACCESS_RULE_CREATE = f"{BASE}/root.AccessRuleGrpcService/Create"
+ACCESS_RULE_EDIT = f"{BASE}/root.AccessRuleGrpcService/Edit"
+ACCESS_RULE_DELETE = f"{BASE}/root.AccessRuleGrpcService/Delete"
+ACCESS_RULE_LIST_TARGET = (
+    f"{BASE}/root.AccessRuleGrpcService/ListByChannelOrChannelGroup"
+)
+
+
+_CHANNEL_PERMISSION_FIELDS = {
+    "channel_full_control": 10,
+    "channel_view": 12,
+    "channel_use_external_emoji": 13,
+    "channel_create_message": 14,
+    "channel_delete_message_other": 15,
+    "channel_manage_pinned_messages": 16,
+    "channel_view_message_history": 17,
+    "channel_create_message_attachment": 18,
+    "channel_create_message_mention": 19,
+    "channel_create_message_reaction": 20,
+    "channel_make_message_public": 21,
+    "channel_move_user_other": 22,
+    "channel_voice_talk": 23,
+    "channel_voice_mute_other": 24,
+    "channel_voice_deafen_other": 25,
+    "channel_voice_kick": 26,
+    "channel_video_stream_media": 27,
+    "channel_create_file": 28,
+    "channel_manage_files": 29,
+    "channel_view_file": 30,
+    "channel_app_kick": 31,
+}
+
+_COMMUNITY_PERMISSION_FIELDS = {
+    "community_manage_community": 10,
+    "community_manage_roles": 11,
+    "community_manage_emojis": 12,
+    "community_manage_audit_log": 13,
+    "community_create_invite": 14,
+    "community_manage_invites": 15,
+    "community_create_ban": 16,
+    "community_manage_bans": 17,
+    "community_full_control": 18,
+    "community_kick": 19,
+    "community_change_my_nickname": 20,
+    "community_change_other_nickname": 21,
+    "community_create_channel_group": 22,
+    "community_manage_apps": 23,
+}
+
+
+def _string_wrapper(value: str) -> bytes:
+    return length_field(1, value.encode("utf-8"))
+
+
+def _encode_bool_permissions(obj, mapping: Dict[str, int]) -> bytes:
+    payload = bytearray()
+    for name, number in mapping.items():
+        if bool(getattr(obj, name)):
+            payload += bool_field(number, True)
+    return bytes(payload)
+
+
+def _encode_overlay(overlay: ChannelOverlay) -> bytes:
+    payload = bytearray()
+    for name, number in _CHANNEL_PERMISSION_FIELDS.items():
+        value = getattr(overlay, name)
+        if value is None:
+            continue
+        wrapper = bool_field(1, True) if value else b""
+        payload += length_field(number, wrapper)
+    return bytes(payload)
+
+
+def _decode_overlay(data: bytes) -> ChannelOverlay:
+    values = {}
+    inverse = {v: k for k, v in _CHANNEL_PERMISSION_FIELDS.items()}
+    for number, wire_type, value in iter_fields(data):
+        if number not in inverse or wire_type != 2:
+            continue
+        flag = False
+        for inner_number, inner_wire, inner_value in iter_fields(value):
+            if inner_number == 1 and inner_wire == 0:
+                flag = bool(inner_value)
+                break
+        values[inverse[number]] = flag
+    return ChannelOverlay(**values)
+
+
+# The colour rules live in rootpy.validation with the username/nickname
+# rules, so there is one place to look when Root rejects a formatted value.
+# Re-exported here because these names were public from this module first.
+from ..validation import (  # noqa: F401
+    DEFAULT_PICTURE_HEX,
+    PICTURE_HEX_LENGTH,
+    normalize_hex_colour,
+)
+
+
+class CommunityAdminService:
+    def __init__(
+        self,
+        transport: GrpcWebTransport,
+        token_getter,
+        community_service,
+        *,
+        client=None,
+    ) -> None:
+        self.transport = transport
+        self._token_getter = token_getter
+        self.community_service = community_service
+        self.client = client
+
+    def _headers(self) -> dict:
+        return {
+            "user-agent": (
+                "grpc-dotnet/2.83.0 "
+                "(.NET 10.0.10; CLR 10.0.10; "
+                "net10.0; windows; x64)"
+            ),
+            "te": "trailers",
+            "grpc-accept-encoding": "identity,gzip,deflate",
+            "authorization": f"Bearer {self._token_getter()}",
+            "content-type": "application/grpc-web",
+            "accept": "application/grpc-web",
+        }
+
+    @staticmethod
+    def _context() -> bytes:
+        high64, low64 = create_command_idempotency_guid()
+        return length_field(
+            4,
+            encode_root_guid_parts(high64, low64),
+        )
+
+    async def _unary(self, endpoint: str, payload: bytes, operation: str):
+        return await self.transport.unary(
+            endpoint=endpoint,
+            body=grpc_frame(payload),
+            headers=self._headers(),
+            operation=operation,
+        )
+
+    @staticmethod
+    def _first_guid(body: bytes, field_number: int) -> Optional[str]:
+        for flag, frame in iter_grpc_web_frames(body):
+            if flag & 0x80:
+                continue
+            for number, wire_type, value in iter_fields(frame):
+                if number == field_number and wire_type == 2:
+                    return decode_root_guid_message(value)
+            break
+        return None
+
+    def _attach(self, obj):
+        if obj is None:
+            return None
+        try:
+            return replace(obj, _admin=self)
+        except TypeError:
+            return obj
+
+    async def create_community(
+        self,
+        name: str,
+        *,
+        picture_hex: str = DEFAULT_PICTURE_HEX,
+        icon_upload_token_uri: Optional[str] = None,
+        description: Optional[str] = None,
+        reject_unverified_email: bool = False,
+        is_age_restricted: bool = False,
+        template_type: str = "",
+    ) -> Community:
+        payload = bytearray()
+        payload += length_field(1, self._context())
+        payload += length_field(10, name.encode("utf-8"))
+        # Always sent. Root's NotEmptyValidator rejects the request when
+        # field 11 is absent, and this used to be wrapped in a truthiness
+        # guard that skipped it whenever the (empty) default was used -- so
+        # create_community could never succeed without an explicit colour.
+        payload += length_field(
+            11, normalize_hex_colour(picture_hex).encode("utf-8")
+        )
+        if template_type:
+            payload += length_field(12, template_type.encode("utf-8"))
+        if icon_upload_token_uri is not None:
+            payload += length_field(
+                13,
+                _string_wrapper(icon_upload_token_uri),
+            )
+        if reject_unverified_email:
+            payload += bool_field(14, True)
+        if description is not None:
+            payload += length_field(16, _string_wrapper(description))
+        if is_age_restricted:
+            payload += bool_field(17, True)
+
+        response = await self._unary(
+            COMMUNITY_CREATE,
+            bytes(payload),
+            "CommunityCreate",
+        )
+        community_id = self._first_guid(response.content, 4)
+        if not community_id:
+            raise RuntimeError("CommunityCreate returned no community ID")
+
+        result = await self.community_service.get_extended(community_id)
+        return self._attach(result.community)
+
+    async def edit_community(
+        self,
+        community_id: str,
+        *,
+        name: Optional[str] = None,
+        picture_hex: Optional[str] = None,
+        picture_token_uri: Optional[str] = None,
+        update_picture: bool = False,
+        default_channel_id: Optional[str] = None,
+        reject_unverified_email: Optional[bool] = None,
+        description: Optional[str] = None,
+        is_age_restricted: Optional[bool] = None,
+    ) -> Community:
+        community_id = normalize_root_guid(community_id)
+        payload = bytearray()
+        payload += length_field(1, self._context())
+        payload += length_field(10, encode_root_guid(community_id))
+
+        # CommunityEdit is a *replace*, not a patch. Root validates Name and
+        # PictureHex as required, so omitting either fails even when you only
+        # meant to change the description -- and fixing them one at a time is
+        # whack-a-mole, because the next required field behaves the same way.
+        # Instead: if anything with replace semantics is missing, read the
+        # community once and carry every such value forward. Supplying all of
+        # them explicitly skips the read entirely.
+        REPLACED = ("name", "picture_hex")
+        supplied = {"name": name, "picture_hex": picture_hex}
+        if any(supplied[f] is None for f in REPLACED):
+            current = (
+                await self.community_service.get_extended(community_id)
+            ).community
+            for attribute in REPLACED:
+                if supplied[attribute] is None:
+                    supplied[attribute] = getattr(current, attribute, None)
+            name = supplied["name"]
+            picture_hex = supplied["picture_hex"]
+
+        payload += length_field(11, (name or "").encode("utf-8"))
+        payload += length_field(
+            12, normalize_hex_colour(picture_hex or DEFAULT_PICTURE_HEX).encode("utf-8")
+        )
+        if update_picture:
+            payload += bool_field(13, True)
+        if picture_token_uri is not None:
+            payload += length_field(14, _string_wrapper(picture_token_uri))
+        if default_channel_id is not None:
+            payload += length_field(
+                15,
+                encode_root_guid(normalize_root_guid(default_channel_id)),
+            )
+        if reject_unverified_email:
+            payload += bool_field(16, True)
+        if description is not None:
+            payload += length_field(18, _string_wrapper(description))
+        if is_age_restricted:
+            payload += bool_field(19, True)
+
+        await self._unary(
+            COMMUNITY_EDIT,
+            bytes(payload),
+            "CommunityEdit",
+        )
+        result = await self.community_service.get_extended(community_id)
+        return self._attach(result.community)
+
+    async def delete_community(self, community_id: str) -> None:
+        community_id = normalize_root_guid(community_id)
+        payload = (
+            length_field(1, self._context())
+            + length_field(10, encode_root_guid(community_id))
+        )
+        await self._unary(
+            COMMUNITY_DELETE,
+            payload,
+            "CommunityDelete",
+        )
+
+    @staticmethod
+    def _access_rule_create_payload(rule: AccessRule) -> bytes:
+        return (
+            length_field(
+                10,
+                encode_root_guid(
+                    normalize_root_guid(rule.target_id)
+                ),
+            )
+            + length_field(
+                11,
+                _encode_overlay(rule.overlay),
+            )
+        )
+
+    async def create_channel_group(
+        self,
+        community_id: str,
+        name: str,
+        *,
+        access_rules: Optional[Iterable[AccessRule]] = None,
+    ) -> ChannelGroup:
+        community_id = normalize_root_guid(community_id)
+        payload = bytearray()
+        payload += length_field(1, self._context())
+        payload += length_field(10, encode_root_guid(community_id))
+        payload += length_field(11, name.encode("utf-8"))
+        for rule in access_rules or ():
+            payload += length_field(
+                12,
+                self._access_rule_create_payload(rule),
+            )
+
+        response = await self._unary(
+            CHANNEL_GROUP_CREATE,
+            bytes(payload),
+            "ChannelGroupCreate",
+        )
+        group_id = self._first_guid(response.content, 5)
+        if not group_id:
+            raise RuntimeError("ChannelGroupCreate returned no ID")
+
+        extended = await self.community_service.get_extended(community_id)
+        for group in extended.channel_groups:
+            if group.id == group_id:
+                return self._attach(group)
+        raise RuntimeError("Created channel group was not returned by GetExtended")
+
+    async def edit_channel_group(
+        self,
+        community_id: str,
+        group_id: str,
+        *,
+        name: str,
+    ) -> ChannelGroup:
+        community_id = normalize_root_guid(community_id)
+        group_id = normalize_root_guid(group_id)
+        payload = (
+            length_field(1, self._context())
+            + length_field(10, encode_root_guid(community_id))
+            + length_field(11, encode_root_guid(group_id))
+            + length_field(12, name.encode("utf-8"))
+        )
+        await self._unary(
+            CHANNEL_GROUP_EDIT,
+            payload,
+            "ChannelGroupEdit",
+        )
+        extended = await self.community_service.get_extended(community_id)
+        for group in extended.channel_groups:
+            if group.id == group_id:
+                return self._attach(group)
+        raise RuntimeError("Edited channel group was not returned by GetExtended")
+
+    async def move_channel_group(
+        self,
+        community_id: str,
+        group_id: str,
+        *,
+        before_group_id: Optional[str] = None,
+    ) -> None:
+        community_id = normalize_root_guid(community_id)
+        group_id = normalize_root_guid(group_id)
+        payload = bytearray()
+        payload += length_field(1, self._context())
+        payload += length_field(10, encode_root_guid(community_id))
+        payload += length_field(11, encode_root_guid(group_id))
+        if before_group_id is not None:
+            payload += length_field(
+                12,
+                encode_root_guid(normalize_root_guid(before_group_id)),
+            )
+        await self._unary(
+            CHANNEL_GROUP_MOVE,
+            bytes(payload),
+            "ChannelGroupMove",
+        )
+
+    async def delete_channel_group(
+        self,
+        community_id: str,
+        group_id: str,
+    ) -> None:
+        community_id = normalize_root_guid(community_id)
+        group_id = normalize_root_guid(group_id)
+        payload = (
+            length_field(1, self._context())
+            + length_field(10, encode_root_guid(community_id))
+            + length_field(11, encode_root_guid(group_id))
+        )
+        await self._unary(
+            CHANNEL_GROUP_DELETE,
+            payload,
+            "ChannelGroupDelete",
+        )
+
+    async def create_channel(
+        self,
+        community_id: str,
+        channel_group_id: str,
+        name: str,
+        *,
+        description: Optional[str] = None,
+        # Defaults to TEXT, not 0. ChannelType 0 is Unspecified, which Root
+        # rejects with a PredicateValidator, so a three-argument call that
+        # does not name a type must default to TEXT rather than 0.
+        channel_type: int = int(ChannelType.TEXT),
+        use_channel_group_permission: bool = False,
+        icon_token_uri: Optional[str] = None,
+        access_rules: Optional[Iterable[AccessRule]] = None,
+    ) -> Channel:
+        community_id = normalize_root_guid(community_id)
+        channel_group_id = normalize_root_guid(channel_group_id)
+
+        payload = bytearray()
+        payload += length_field(1, self._context())
+        payload += length_field(10, encode_root_guid(community_id))
+        payload += length_field(11, encode_root_guid(channel_group_id))
+        payload += length_field(12, name.encode("utf-8"))
+        if description is not None:
+            payload += length_field(13, _string_wrapper(description))
+        if channel_type:
+            payload += field_key(14, 0) + encode_varint(channel_type)
+        if use_channel_group_permission:
+            payload += bool_field(15, True)
+        if icon_token_uri is not None:
+            payload += length_field(16, _string_wrapper(icon_token_uri))
+        for rule in access_rules or ():
+            payload += length_field(
+                17,
+                self._access_rule_create_payload(rule),
+            )
+
+        response = await self._unary(
+            CHANNEL_CREATE,
+            bytes(payload),
+            "ChannelCreate",
+        )
+        channel_id = self._first_guid(response.content, 6)
+        if not channel_id:
+            raise RuntimeError("ChannelCreate returned no ID")
+
+        extended = await self.community_service.get_extended(community_id)
+        for group in extended.channel_groups:
+            for channel in group.channels:
+                if channel.id == channel_id:
+                    return self._attach(channel)
+        raise RuntimeError("Created channel was not returned by GetExtended")
+
+    async def edit_channel(
+        self,
+        community_id: str,
+        channel_id: str,
+        *,
+        name: str,
+        description: Optional[str] = None,
+        update_icon: bool = False,
+        icon_token_uri: Optional[str] = None,
+        use_channel_group_permission: bool = False,
+    ) -> Channel:
+        community_id = normalize_root_guid(community_id)
+        channel_id = normalize_root_guid(channel_id)
+
+        payload = bytearray()
+        payload += length_field(1, self._context())
+        payload += length_field(10, encode_root_guid(community_id))
+        payload += length_field(11, encode_root_guid(channel_id))
+        payload += length_field(12, name.encode("utf-8"))
+        if description is not None:
+            payload += length_field(13, _string_wrapper(description))
+        if update_icon:
+            payload += bool_field(14, True)
+        if icon_token_uri is not None:
+            payload += length_field(15, _string_wrapper(icon_token_uri))
+        if use_channel_group_permission:
+            payload += bool_field(16, True)
+
+        await self._unary(
+            CHANNEL_EDIT,
+            bytes(payload),
+            "ChannelEdit",
+        )
+        extended = await self.community_service.get_extended(community_id)
+        for group in extended.channel_groups:
+            for channel in group.channels:
+                if channel.id == channel_id:
+                    return self._attach(channel)
+        raise RuntimeError("Edited channel was not returned by GetExtended")
+
+    async def move_channel(
+        self,
+        community_id: str,
+        channel_id: str,
+        *,
+        old_group_id: Optional[str] = None,
+        new_group_id: Optional[str] = None,
+        before_channel_id: Optional[str] = None,
+    ) -> None:
+        community_id = normalize_root_guid(community_id)
+        channel_id = normalize_root_guid(channel_id)
+
+        payload = bytearray()
+        payload += length_field(1, self._context())
+        payload += length_field(10, encode_root_guid(community_id))
+        payload += length_field(11, encode_root_guid(channel_id))
+
+        if old_group_id is not None:
+            payload += length_field(
+                12,
+                encode_root_guid(normalize_root_guid(old_group_id)),
+            )
+        if new_group_id is not None:
+            payload += length_field(
+                13,
+                encode_root_guid(normalize_root_guid(new_group_id)),
+            )
+        if before_channel_id is not None:
+            payload += length_field(
+                14,
+                encode_root_guid(normalize_root_guid(before_channel_id)),
+            )
+
+        await self._unary(
+            CHANNEL_MOVE,
+            bytes(payload),
+            "ChannelMove",
+        )
+
+    async def delete_channel(
+        self,
+        community_id: str,
+        channel_id: str,
+    ) -> None:
+        community_id = normalize_root_guid(community_id)
+        channel_id = normalize_root_guid(channel_id)
+        payload = (
+            length_field(1, self._context())
+            + length_field(10, encode_root_guid(community_id))
+            + length_field(11, encode_root_guid(channel_id))
+        )
+        await self._unary(
+            CHANNEL_DELETE,
+            payload,
+            "ChannelDelete",
+        )
+
+    async def create_role(
+        self,
+        community_id: str,
+        name: str,
+        *,
+        color_hex: Optional[str] = None,
+        community_permissions: Optional[CommunityPermission] = None,
+        channel_permissions: Optional[ChannelPermissions] = None,
+        mentionable: bool = False,
+        self_assignable: bool = False,
+    ) -> CommunityRole:
+        community_id = normalize_root_guid(community_id)
+
+        payload = bytearray()
+        payload += length_field(1, self._context())
+        payload += length_field(10, encode_root_guid(community_id))
+        payload += length_field(11, name.encode("utf-8"))
+
+        if color_hex is not None:
+            # Same "#rrggbb" form as PictureHex -- proven against the live API
+            # by create_role. Normalising here means callers can pass
+            # "3498db" or "#3498DB" and neither costs a round trip to learn
+            # that Root wanted exactly seven characters.
+            payload += length_field(
+                12,
+                _string_wrapper(
+                    normalize_hex_colour(color_hex, field_name="color_hex")
+                ),
+            )
+        if community_permissions is not None:
+            payload += length_field(
+                15,
+                _encode_bool_permissions(
+                    community_permissions,
+                    _COMMUNITY_PERMISSION_FIELDS,
+                ),
+            )
+        if channel_permissions is not None:
+            payload += length_field(
+                16,
+                _encode_bool_permissions(
+                    channel_permissions,
+                    _CHANNEL_PERMISSION_FIELDS,
+                ),
+            )
+        if mentionable:
+            payload += bool_field(17, True)
+        if self_assignable:
+            payload += bool_field(18, True)
+
+        response = await self._unary(
+            ROLE_CREATE,
+            bytes(payload),
+            "CommunityRoleCreate",
+        )
+        role_id = self._first_guid(response.content, 4)
+        if not role_id:
+            raise RuntimeError("CommunityRoleCreate returned no ID")
+
+        extended = await self.community_service.get_extended(community_id)
+        for role in extended.roles:
+            if role.id == role_id:
+                return role
+        raise RuntimeError("Created role was not returned by GetExtended")
+
+    async def edit_role(
+        self,
+        community_id: str,
+        role_id: str,
+        *,
+        name: str,
+        color_hex: Optional[str] = None,
+        community_permissions: Optional[CommunityPermission] = None,
+        channel_permissions: Optional[ChannelPermissions] = None,
+        mentionable: Optional[bool] = None,
+        self_assignable: Optional[bool] = None,
+    ) -> CommunityRole:
+        """Edit a role.
+
+        ``CommunityRoleEdit`` is a replace, like ``CommunityEdit``: it carries
+        Name, ColorHex and both permission sets, so an empty ColorHex blanked
+        the colour and Root answered INTERNAL (13) rather than a validation
+        error. ``color_hex`` now defaults to None and falls back to the role's
+        current colour, or to ``DEFAULT_PICTURE_HEX`` when that is unknown.
+        """
+        community_id = normalize_root_guid(community_id)
+        role_id = normalize_root_guid(role_id)
+
+        # CommunityRoleEdit is a *replace*: Name, ColorHex, both permission
+        # sets and the two flags all go on the wire, and anything omitted is
+        # blanked. Fixing only ColorHex was not enough -- dropping the
+        # permission sets still made Root answer INTERNAL (13). Read the role
+        # once and carry forward every value the caller did not supply.
+        needs_current = (
+            color_hex is None
+            or community_permissions is None
+            or channel_permissions is None
+            or mentionable is None
+            or self_assignable is None
+        )
+        current = None
+        if needs_current:
+            # The read is load-bearing, so its failure must not be swallowed.
+            # This used to be wrapped in ``except Exception: current = None``,
+            # which turned any transient failure -- a 429 cooldown, a
+            # PERMISSION_DENIED, a network blip -- into a *destructive*
+            # replace: colour reset to DEFAULT_PICTURE_HEX and both permission
+            # sets dropped from the payload, which is the very thing the
+            # comment above says makes Root answer INTERNAL (13). A partial
+            # ``edit_role(cid, rid, name="x")`` silently became "rename this
+            # role and wipe its permissions".
+            #
+            # ``edit_community`` does the same read-before-replace with no
+            # try/except at all; this now matches it.
+            extended = await self.community_service.get_extended(community_id)
+            current = next(
+                (r for r in extended.roles if r.id == role_id), None
+            )
+            if current is None:
+                raise ValueError(
+                    f"role {role_id} is not in community {community_id}, so "
+                    "the values you did not supply cannot be carried forward. "
+                    "CommunityRoleEdit is a replace: sending it now would "
+                    "blank the role's colour and permissions. Pass color_hex, "
+                    "community_permissions and channel_permissions explicitly "
+                    "to edit a role this client cannot read."
+                )
+
+        if color_hex is None:
+            color_hex = getattr(current, "color_hex", None) or DEFAULT_PICTURE_HEX
+        color_hex = normalize_hex_colour(color_hex, field_name="color_hex")
+
+        # CommunityRole names these `community_permissions` and, for the
+        # channel set, plain `permissions` -- not `channel_permissions`.
+        # Reading the wrong name returns None silently, the field is then
+        # omitted, and Root answers INTERNAL (13) rather than a validation
+        # error.
+        if community_permissions is None:
+            community_permissions = getattr(current, "community_permissions", None)
+        if channel_permissions is None:
+            channel_permissions = getattr(current, "permissions", None)
+        # Carry a flag forward only when the caller said nothing about it.
+        # These used to default to False and be carried forward on any falsey
+        # value, which made ``mentionable=False`` indistinguishable from "not
+        # supplied" -- so turning either flag *off* read the current value
+        # back, re-sent it, and reported success while changing nothing. None
+        # is the only value that means "leave it alone".
+        if mentionable is None:
+            mentionable = bool(getattr(current, "is_mentionable", False))
+        if self_assignable is None:
+            self_assignable = bool(
+                getattr(current, "is_self_assignable", False)
+            )
+
+        payload = bytearray()
+        payload += length_field(1, self._context())
+        payload += length_field(10, encode_root_guid(community_id))
+        payload += length_field(11, encode_root_guid(role_id))
+        payload += length_field(13, name.encode("utf-8"))
+        if color_hex:
+            payload += length_field(14, color_hex.encode("utf-8"))
+        if community_permissions is not None:
+            payload += length_field(
+                15,
+                _encode_bool_permissions(
+                    community_permissions,
+                    _COMMUNITY_PERMISSION_FIELDS,
+                ),
+            )
+        if channel_permissions is not None:
+            payload += length_field(
+                16,
+                _encode_bool_permissions(
+                    channel_permissions,
+                    _CHANNEL_PERMISSION_FIELDS,
+                ),
+            )
+        if mentionable:
+            payload += bool_field(17, True)
+        if self_assignable:
+            payload += bool_field(18, True)
+
+        await self._unary(
+            ROLE_EDIT,
+            bytes(payload),
+            "CommunityRoleEdit",
+        )
+        extended = await self.community_service.get_extended(community_id)
+        for role in extended.roles:
+            if role.id == role_id:
+                return role
+        raise RuntimeError("Edited role was not returned by GetExtended")
+
+    async def move_role(
+        self,
+        community_id: str,
+        role_id: str,
+        *,
+        before_role_id: Optional[str] = None,
+    ) -> None:
+        community_id = normalize_root_guid(community_id)
+        role_id = normalize_root_guid(role_id)
+
+        payload = bytearray()
+        payload += length_field(1, self._context())
+        payload += length_field(10, encode_root_guid(community_id))
+        payload += length_field(11, encode_root_guid(role_id))
+        if before_role_id is not None:
+            payload += length_field(
+                12,
+                encode_root_guid(normalize_root_guid(before_role_id)),
+            )
+
+        await self._unary(
+            ROLE_MOVE,
+            bytes(payload),
+            "CommunityRoleMove",
+        )
+
+    async def delete_role(
+        self,
+        community_id: str,
+        role_id: str,
+    ) -> None:
+        community_id = normalize_root_guid(community_id)
+        role_id = normalize_root_guid(role_id)
+        payload = (
+            length_field(1, self._context())
+            + length_field(10, encode_root_guid(community_id))
+            + length_field(11, encode_root_guid(role_id))
+        )
+        await self._unary(
+            ROLE_DELETE,
+            payload,
+            "CommunityRoleDelete",
+        )
+
+    async def list_access_rules(
+        self,
+        community_id: str,
+        channel_or_group_id: str,
+    ) -> Tuple[AccessRule, ...]:
+        community_id = normalize_root_guid(community_id)
+        channel_or_group_id = normalize_root_guid(channel_or_group_id)
+
+        payload = (
+            length_field(10, encode_root_guid(community_id))
+            + length_field(11, encode_root_guid(channel_or_group_id))
+        )
+        response = await self._unary(
+            ACCESS_RULE_LIST_TARGET,
+            payload,
+            "AccessRuleListByChannelOrChannelGroup",
+        )
+
+        result = []
+        for flag, frame in iter_grpc_web_frames(response.content):
+            if flag & 0x80:
+                continue
+            for number, wire_type, value in iter_fields(frame):
+                if number != 10 or wire_type != 2:
+                    continue
+                target_id = None
+                overlay = ChannelOverlay()
+                for inner_number, inner_wire, inner_value in iter_fields(value):
+                    if inner_number == 5 and inner_wire == 2:
+                        target_id = decode_root_guid_message(inner_value)
+                    elif inner_number == 6 and inner_wire == 2:
+                        overlay = _decode_overlay(inner_value)
+                if target_id:
+                    result.append(AccessRule(target_id, overlay))
+            break
+        return tuple(result)
+
+    async def set_access_rule(
+        self,
+        community_id: str,
+        channel_or_group_id: str,
+        target_id: str,
+        overlay: ChannelOverlay,
+        *,
+        exists: bool = False,
+    ) -> None:
+        community_id = normalize_root_guid(community_id)
+        channel_or_group_id = normalize_root_guid(channel_or_group_id)
+        target_id = normalize_root_guid(target_id)
+
+        payload = (
+            length_field(1, self._context())
+            + length_field(10, encode_root_guid(community_id))
+            + length_field(11, encode_root_guid(channel_or_group_id))
+            + length_field(12, encode_root_guid(target_id))
+            + length_field(13, _encode_overlay(overlay))
+        )
+
+        await self._unary(
+            ACCESS_RULE_EDIT if exists else ACCESS_RULE_CREATE,
+            payload,
+            "AccessRuleEdit" if exists else "AccessRuleCreate",
+        )
+
+    async def delete_access_rule(
+        self,
+        community_id: str,
+        channel_or_group_id: str,
+        target_id: str,
+    ) -> None:
+        community_id = normalize_root_guid(community_id)
+        channel_or_group_id = normalize_root_guid(channel_or_group_id)
+        target_id = normalize_root_guid(target_id)
+
+        payload = (
+            length_field(1, self._context())
+            + length_field(10, encode_root_guid(community_id))
+            + length_field(11, encode_root_guid(channel_or_group_id))
+            + length_field(12, encode_root_guid(target_id))
+        )
+        await self._unary(
+            ACCESS_RULE_DELETE,
+            payload,
+            "AccessRuleDelete",
+        )
+
+    async def clone_community(
+        self,
+        source_community_id: str,
+        *,
+        name: Optional[str] = None,
+        clone_roles: bool = True,
+        clone_access_rules: bool = True,
+        clone_member_overrides: bool = False,
+    ) -> Community:
+
+        source_community_id = normalize_root_guid(source_community_id)
+        source = await self.community_service.get_extended(source_community_id)
+
+        target = await self.create_community(
+            name or source.community.name,
+            picture_hex=source.community.picture_hex,
+            description=source.community.description,
+            reject_unverified_email=source.community.reject_unverified_email,
+            is_age_restricted=source.community.is_age_restricted,
+        )
+        target_id = target.id
+
+        target_extended = await self.community_service.get_extended(target_id)
+
+        role_map: Dict[str, str] = {}
+
+        source_roles = sorted(source.roles, key=lambda r: r.position)
+        target_roles = sorted(target_extended.roles, key=lambda r: r.position)
+
+        if source_roles and target_roles:
+            role_map[source_roles[0].id] = target_roles[0].id
+
+        if clone_roles:
+            for role in reversed(source_roles[1:]):
+                created = await self.create_role(
+                    target_id,
+                    role.name,
+                    color_hex=role.color_hex or None,
+                    community_permissions=role.community_permissions,
+                    channel_permissions=role.permissions,
+                    mentionable=role.is_mentionable,
+                    self_assignable=role.is_self_assignable,
+                )
+                role_map[role.id] = created.id
+
+        def remap_rules(rules):
+            mapped = []
+            for rule in rules:
+                replacement = role_map.get(rule.target_id)
+                if replacement is not None:
+                    mapped.append(AccessRule(replacement, rule.overlay))
+                elif clone_member_overrides:
+                    mapped.append(rule)
+            return mapped
+
+        group_map: Dict[str, str] = {}
+        channel_map: Dict[str, str] = {}
+
+        for source_group in sorted(source.channel_groups, key=lambda g: g.position):
+            group_rules = ()
+            if clone_access_rules:
+                group_rules = remap_rules(
+                    await self.list_access_rules(
+                        source_community_id,
+                        source_group.id,
+                    )
+                )
+            created_group = await self.create_channel_group(
+                target_id,
+                source_group.name,
+                access_rules=group_rules,
+            )
+            group_map[source_group.id] = created_group.id
+
+            for source_channel in sorted(
+                source_group.channels,
+                key=lambda c: c.position,
+            ):
+                rules = ()
+                if clone_access_rules and not source_channel.use_channel_group_permission:
+                    rules = remap_rules(
+                        await self.list_access_rules(
+                            source_community_id,
+                            source_channel.id,
+                        )
+                    )
+
+                created_channel = await self.create_channel(
+                    target_id,
+                    created_group.id,
+                    source_channel.name,
+                    description=source_channel.description,
+                    channel_type=source_channel.channel_type,
+                    use_channel_group_permission=(
+                        source_channel.use_channel_group_permission
+                    ),
+                    access_rules=rules,
+                )
+                channel_map[source_channel.id] = created_channel.id
+
+        mapped_default = channel_map.get(source.community.default_channel_id or "")
+        if mapped_default is not None:
+            await self.edit_community(
+                target_id,
+                default_channel_id=mapped_default,
+            )
+
+        final = await self.community_service.get_extended(target_id)
+        return self._attach(final.community)

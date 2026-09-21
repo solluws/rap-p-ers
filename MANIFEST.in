@@ -1,0 +1,19 @@
+# The sdist is the library plus the two documents a reader needs offline.
+# Everything else in this repository -- the test suite, the examples and the
+# CI configuration -- is repository material and is deliberately left out of
+# the distribution.
+include LICENSE README.md
+
+# The protocol registries. Without them the package installs and every schema
+# lookup raises, so this line is load-bearing in the sdist exactly as
+# [tool.setuptools.package-data] is in the wheel.
+recursive-include rootpy/data *.json
+
+# PEP 561 marker for the "Typing :: Typed" classifier.
+include rootpy/py.typed
+
+prune tests
+prune examples
+prune .github
+
+global-exclude *.py[cod] __pycache__/* *.log tokens*.txt *.token .env

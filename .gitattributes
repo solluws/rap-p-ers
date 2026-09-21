@@ -1,0 +1,5 @@
+# This tree mixes line endings on purpose: a few documents are CRLF and
+# everything else is LF. `-text` turns end-of-line conversion off in both
+# directions, so a checkout is byte-identical to what was committed and a
+# clone on Windows does not produce a whole-file diff.
+* -text

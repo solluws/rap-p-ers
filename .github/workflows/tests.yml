@@ -1,0 +1,97 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run tests
+        run: python -m pytest tests/ -q
+
+      - name: Check the scripts still import
+        run: python -m compileall -q example.py examples/
+
+  wheel:
+    # The registries are ~1.1 MB of JSON under rootpy/data/. Without them the
+    # package installs and every schema lookup raises, and nothing in the test
+    # suite above would notice, because it runs from the source tree. These
+    # two jobs are the only thing standing between that and PyPI.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Build
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Wheel ships the protocol data files
+        run: |
+          python - <<'PY'
+          import glob, zipfile
+          names = zipfile.ZipFile(sorted(glob.glob("dist/*.whl"))[-1]).namelist()
+          data = [n for n in names if n.endswith(".json")]
+          assert len(data) == 5, f"expected 5 data files in the wheel, got {data}"
+          assert any(n.endswith("rootpy/py.typed") for n in names), \
+              "py.typed missing; the Typing :: Typed classifier is a false claim"
+          assert not [n for n in names if "examples" in n], "examples leaked into the wheel"
+          print("wheel OK:", data)
+          PY
+
+      - name: Sdist ships them too, and the installed package can read them
+        run: |
+          python -m venv /tmp/v
+          /tmp/v/bin/pip install --quiet dist/*.tar.gz
+          /tmp/v/bin/python - <<'PY'
+          import sys
+          from importlib.metadata import version
+          from rootpy.structured_registry import MESSAGES
+          import rootpy
+
+          # A lower bound, not an equality: this gate exists to catch a
+          # distribution that shipped without its data files, and the
+          # registry grows every time Root does. The exact count is pinned
+          # in tests/test_untested_surface.py, which is where a change to
+          # it should have to be acknowledged.
+          assert len(MESSAGES) >= 842, f"registry is short: {len(MESSAGES)}"
+          first = next(iter(MESSAGES.values()))
+          assert "source" not in first, "registry entries carry a stray 'source' key"
+          assert version("rootpy-client"), "installed distribution has no version"
+          assert "httpx" not in sys.modules, "httpx must stay off the import path"
+          assert "rootpy.services.calls" not in sys.modules, "voice must stay lazy"
+          print("sdist install OK")
+          PY
+
+      - name: Metadata is valid for PyPI
+        run: |
+          python -m pip install --upgrade twine
+          python -m twine check --strict dist/*
